@@ -1,11 +1,13 @@
 import type {
+  AppendAck,
   ChildResult,
   ClaimedCheck,
+  ExpansionAck,
   Lease,
   Progress,
   QueueStats,
 } from './types.js';
-import type { WorkerBackend } from './worker.js';
+import type { BeginExpansionAck, WorkerBackend } from './worker.js';
 import type { CheckDescriptor } from './types.js';
 
 export interface HttpQueueClientOptions {
@@ -82,6 +84,31 @@ export class HttpQueueClient implements WorkerBackend {
       leaseToken: lease.leaseToken,
       fence: lease.fence,
       children,
+    });
+  }
+
+  async beginExpansion(lease: Lease): Promise<BeginExpansionAck> {
+    return this.post(`/v1/checks/${encodeURIComponent(lease.id)}/begin-expand`, {
+      workerId: lease.workerId,
+      leaseToken: lease.leaseToken,
+      fence: lease.fence,
+    });
+  }
+
+  async appendExpansion(lease: Lease, children: CheckDescriptor[]): Promise<AppendAck> {
+    return this.post(`/v1/checks/${encodeURIComponent(lease.id)}/append-expand`, {
+      workerId: lease.workerId,
+      leaseToken: lease.leaseToken,
+      fence: lease.fence,
+      children,
+    });
+  }
+
+  async commitExpansion(lease: Lease): Promise<ExpansionAck> {
+    return this.post(`/v1/checks/${encodeURIComponent(lease.id)}/commit-expand`, {
+      workerId: lease.workerId,
+      leaseToken: lease.leaseToken,
+      fence: lease.fence,
     });
   }
 

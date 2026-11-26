@@ -8,6 +8,9 @@ import {
   ClaimedCheck,
   CompletionInput,
   ExpansionAck,
+  ExpansionStateName,
+  ExpansionStatus,
+  AppendAck,
   Lease,
   LeaseFencedError,
   ListReadStat,
@@ -49,6 +52,8 @@ interface CheckRow {
   submitted_seq: number | bigint | null;
   admission_seq: number | bigint | null;
   ready_since: number | bigint | null;
+  expansion_state: ExpansionStateName | null;
+  expansion_registered: number | bigint | null;
   created_at: number | bigint;
   updated_at: number | bigint;
 }
@@ -136,6 +141,8 @@ export class Queue {
         submitted_seq INTEGER,
         admission_seq INTEGER,
         ready_since INTEGER,
+        expansion_state TEXT,
+        expansion_registered INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(parent_id, child_key)
@@ -189,6 +196,16 @@ export class Queue {
       CREATE INDEX IF NOT EXISTS idx_events_worker
         ON worker_events(worker_id, event);
     `);
+
+    // Forward migration for databases created before segmented handover.
+    const columns = this.db.prepare('PRAGMA table_info(checks)').all() as Array<{ name: string }>;
+    const columnNames = new Set(columns.map((column) => column.name));
+    if (!columnNames.has('expansion_state')) {
+      this.db.exec('ALTER TABLE checks ADD COLUMN expansion_state TEXT');
+    }
+    if (!columnNames.has('expansion_registered')) {
+      this.db.exec('ALTER TABLE checks ADD COLUMN expansion_registered INTEGER');
+    }
 
     const existingLimit = this.getMeta('ready_limit');
     if (existingLimit === null) {
@@ -335,6 +352,13 @@ export class Queue {
     return row;
   }
 
+  private expansionStatus(row: CheckRow): ExpansionStatus {
+    return {
+      state: row.expansion_state ?? 'none',
+      registered: num(row.expansion_registered),
+    };
+  }
+
   private toClaimed(row: CheckRow): ClaimedCheck {
     return {
       id: row.id,
@@ -352,6 +376,7 @@ export class Queue {
       leaseToken: row.lease_token ?? '',
       leaseExpiresAt: num(row.lease_expires_at),
       claimedAt: this.now(),
+      expansion: this.expansionStatus(row),
     };
   }
 
@@ -469,6 +494,10 @@ export class Queue {
          WHERE c.status = 'staged'
            AND c.parent_id IS NOT NULL
            AND c.resumable = 0
+           AND EXISTS (
+             SELECT 1 FROM checks p
+             WHERE p.id = c.parent_id AND p.expansion_state = 'confirmed'
+           )
          ORDER BY r.submitted_seq ASC,
                   c.created_at ASC,
                   c.parent_id ASC,
@@ -655,22 +684,153 @@ export class Queue {
   }
 
   /**
-   * Durably register a child checklist and release the parent's execution slot.
-   * All descriptors are persisted; only one bounded segment is made ready now.
+   * Stage a streamed checklist handover. The parent keeps its lease (and its
+   * worker's execution slot) while descriptors are appended in bounded
+   * segments; children stay `staged` and unclaimable until commit.
    */
-  expand(lease: Lease, input: { children: CheckDescriptor[] }): ExpansionAck {
-    const children = input.children ?? [];
-    if (!Array.isArray(children)) throw new ValidationError('children must be an array');
-
+  beginExpansion(lease: Lease): {
+    id: string;
+    state: ExpansionStateName;
+    registered: number;
+    readLimit: number;
+  } {
     return this.withTx(() => {
       const parent = this.assertActiveLease(lease);
+      const state = parent.expansion_state ?? 'none';
+      if (state === 'confirmed') {
+        throw new ValidationError(`checklist already confirmed for ${parent.id}`);
+      }
+      const now = this.now();
+      if (state === 'none') {
+        this.db
+          .prepare(
+            `UPDATE checks
+               SET expansion_state = 'open', expansion_registered = 0, updated_at = ?
+             WHERE id = ? AND status = 'leased'`,
+          )
+          .run(now, parent.id);
+      }
+      const row = this.requireRow(parent.id);
+      this.recordEvent('checklist-begin', lease.workerId, row, {
+        registered: num(row.expansion_registered),
+      });
+      return {
+        id: row.id,
+        state: 'open' as ExpansionStateName,
+        registered: num(row.expansion_registered),
+        readLimit: this.readyLimit,
+      };
+    });
+  }
+
+  /**
+   * Insert one durable segment of descriptors under `parent` and record its
+   * registration volume. Callers must keep `descriptors.length` within
+   * `readyLimit`; this is the only place that decodes descriptors into rows.
+   */
+  private insertChildSegment(
+    parent: CheckRow,
+    descriptors: CheckDescriptor[],
+    base: number,
+    now: number,
+    trigger: string,
+  ): number {
+    const insert = this.db.prepare(
+      `INSERT INTO checks(
+         id, root_id, parent_id, child_key, ordinal, kind, input_json,
+         status, resumable, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', 0, ?, ?)`,
+    );
+
+    descriptors.forEach((child, index) => {
+      if (!child.kind) throw new ValidationError(`child at ordinal ${base + index} lacks kind`);
+      const key = child.key ?? String(base + index);
+      const id = child.id ?? randomUUID();
+      // A duplicate key aborts the transaction: a retry must resume from the
+      // durable registered offset rather than replaying a committed segment.
+      insert.run(
+        id,
+        parent.root_id,
+        parent.id,
+        key,
+        base + index,
+        child.kind,
+        JSON.stringify(child.input ?? null),
+        now,
+        now,
+      );
+    });
+
+    this.recordListRead({
+      op: 'register',
+      trigger,
+      parentId: parent.id,
+      readCount: descriptors.length,
+      readyBefore: this.readyCount(),
+      detail: { added: descriptors.length, registered: base + descriptors.length },
+    });
+    return descriptors.length;
+  }
+
+  /**
+   * Append one bounded segment of descriptors. A single call decodes at most
+   * `readyLimit` descriptors; the count is recorded as a `register` read stat.
+   */
+  appendExpansion(lease: Lease, children: CheckDescriptor[]): AppendAck {
+    if (!Array.isArray(children)) throw new ValidationError('children must be an array');
+    return this.withTx(() => {
+      const parent = this.assertActiveLease(lease);
+      if ((parent.expansion_state ?? 'none') !== 'open') {
+        throw new ValidationError(`checklist handover is not open for ${parent.id}`);
+      }
+      if (children.length > this.readyLimit) {
+        throw new ValidationError(
+          `append segment carries ${children.length} descriptors, exceeding readyLimit ${this.readyLimit}`,
+        );
+      }
+
+      const base = num(parent.expansion_registered);
+      const now = this.now();
+      this.insertChildSegment(parent, children, base, now, 'append');
+      const registered = base + children.length;
+      this.db
+        .prepare('UPDATE checks SET expansion_registered = ?, updated_at = ? WHERE id = ?')
+        .run(registered, now, parent.id);
+      this.updatePeak();
+      this.recordEvent('checklist-append', lease.workerId, parent, {
+        added: children.length,
+        registered,
+      });
+
+      return {
+        id: parent.id,
+        state: 'open' as ExpansionStateName,
+        registered,
+        added: children.length,
+        decoded: children.length,
+        readLimit: this.readyLimit,
+      };
+    });
+  }
+
+  /**
+   * Confirm the whole checklist. Only now may any child be claimed, and only a
+   * bounded segment is admitted immediately. The parent releases its slot.
+   */
+  commitExpansion(lease: Lease): ExpansionAck {
+    return this.withTx(() => {
+      const parent = this.assertActiveLease(lease);
+      if ((parent.expansion_state ?? 'none') !== 'open') {
+        throw new ValidationError(`no open checklist handover to confirm for ${parent.id}`);
+      }
+
       const readyBefore = this.readyCount();
       const now = this.now();
-
       this.db
         .prepare(
           `UPDATE checks
              SET status = 'waiting',
+                 expansion_state = 'confirmed',
                  lease_token = NULL,
                  lease_expires_at = NULL,
                  updated_at = ?
@@ -678,62 +838,117 @@ export class Queue {
         )
         .run(now, parent.id);
 
-      const insert = this.db.prepare(
-        `INSERT OR IGNORE INTO checks(
-           id, root_id, parent_id, child_key, ordinal, kind, input_json,
-           status, resumable, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', 0, ?, ?)`,
-      );
-
-      children.forEach((child, index) => {
-        if (!child.kind) throw new ValidationError(`child at ordinal ${index} lacks kind`);
-        const key = child.key ?? String(index);
-        const id = child.id ?? randomUUID();
-        insert.run(
-          id,
-          parent.root_id,
-          parent.id,
-          key,
-          index,
-          child.kind,
-          JSON.stringify(child.input ?? null),
-          now,
-          now,
-        );
+      this.admitPriorityItems();
+      const readRows = this.admitParentSegment(parent.id, now);
+      const totalChildren = this.countChildren(parent.id);
+      this.updatePeak();
+      this.recordListRead({
+        op: 'expand',
+        trigger: 'confirm',
+        parentId: parent.id,
+        readCount: readRows.length,
+        readyBefore,
+        detail: {
+          registered: num(parent.expansion_registered),
+          totalChildren,
+          admitted: readRows.length,
+        },
+      });
+      this.recordEvent('checklist-confirmed', lease.workerId, parent, {
+        registered: num(parent.expansion_registered),
+        admitted: readRows.length,
       });
 
-      // If capacity exists, priority work should enter first. Under the
-      // scheduler invariant a pending priority item implies a full buffer, so
-      // this normally changes nothing here.
-      this.admitPriorityItems();
+      return {
+        id: parent.id,
+        totalChildren,
+        admitted: readRows.length,
+        checklistRead: readRows.length,
+        readLimit: this.readyLimit,
+      };
+    });
+  }
 
-      const free = this.readyLimit - this.readyCount();
-      const pageLimit = Math.max(0, Math.min(this.readyLimit, free));
-      let readRows: Array<{ id: string }> = [];
-      if (pageLimit > 0) {
-        readRows = this.db
-          .prepare(
-            `SELECT id FROM checks
-             WHERE parent_id = ? AND status = 'staged'
-             ORDER BY ordinal ASC
-             LIMIT ?`,
-          )
-          .all(parent.id, pageLimit) as Array<{ id: string }>;
-        for (const row of readRows) {
-          this.db
-            .prepare(
-              `UPDATE checks SET status = 'ready', ready_since = ?, updated_at = ?
-               WHERE id = ? AND status = 'staged'`,
-            )
-            .run(now, now, row.id);
-        }
+  /** Read at most `readyLimit` staged children of one parent and admit them. */
+  private admitParentSegment(parentId: string, now: number): Array<{ id: string }> {
+    const free = this.readyLimit - this.readyCount();
+    const pageLimit = Math.max(0, Math.min(this.readyLimit, free));
+    if (pageLimit <= 0) return [];
+    const readRows = this.db
+      .prepare(
+        `SELECT id FROM checks
+         WHERE parent_id = ? AND status = 'staged'
+         ORDER BY ordinal ASC
+         LIMIT ?`,
+      )
+      .all(parentId, pageLimit) as Array<{ id: string }>;
+    for (const row of readRows) {
+      this.db
+        .prepare(
+          `UPDATE checks SET status = 'ready', ready_since = ?, updated_at = ?
+           WHERE id = ? AND status = 'staged'`,
+        )
+        .run(now, now, row.id);
+    }
+    return readRows;
+  }
+
+  private countChildren(parentId: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM checks WHERE parent_id = ?')
+      .get(parentId) as { n: number | bigint };
+    return num(row.n);
+  }
+
+  /**
+   * Legacy one-shot handover: register a complete in-memory checklist and
+   * confirm it in the same durable transaction, admitting one bounded segment.
+   * Array handlers keep using this normal entry.
+   */
+  expand(lease: Lease, input: { children: CheckDescriptor[] }): ExpansionAck {
+    const children = input.children ?? [];
+    if (!Array.isArray(children)) throw new ValidationError('children must be an array');
+
+    return this.withTx(() => {
+      const parent = this.assertActiveLease(lease);
+      const existingState = parent.expansion_state ?? 'none';
+      if (existingState === 'confirmed') {
+        throw new ValidationError(`checklist already confirmed for ${parent.id}`);
       }
+      const readyBefore = this.readyCount();
+      const now = this.now();
+      const base = existingState === 'open' ? num(parent.expansion_registered) : 0;
 
+      // Walks the array in registerLimited segments so even an in-memory array
+      // handover never decodes more descriptors per operation than the cap.
+      for (let offset = 0; offset < children.length; offset += this.readyLimit) {
+        this.insertChildSegment(
+          parent,
+          children.slice(offset, offset + this.readyLimit),
+          base + offset,
+          now,
+          existingState === 'open' ? 'append' : 'register',
+        );
+      }
+      const registered = base + children.length;
+
+      this.db
+        .prepare(
+          `UPDATE checks
+             SET status = 'waiting',
+                 expansion_state = 'confirmed',
+                 expansion_registered = ?,
+                 lease_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(registered, now, parent.id);
+
+      this.admitPriorityItems();
+      const readRows = this.admitParentSegment(parent.id, now);
       this.updatePeak();
-      const totalChildrenRow = this.db
-        .prepare('SELECT COUNT(*) AS n FROM checks WHERE parent_id = ?')
-        .get(parent.id) as { n: number | bigint };
-      const totalChildren = num(totalChildrenRow.n);
+      const totalChildren = this.countChildren(parent.id);
 
       this.recordListRead({
         op: 'expand',
@@ -741,7 +956,7 @@ export class Queue {
         parentId: parent.id,
         readCount: readRows.length,
         readyBefore,
-        detail: { requested: children.length, totalChildren },
+        detail: { requested: children.length, totalChildren, registered },
       });
       this.recordEvent('expanded', lease.workerId, parent, {
         children: children.length,
@@ -829,6 +1044,24 @@ export class Queue {
           );
       }
 
+      // A check that fails while still holding an unconfirmed, partially
+      // registered checklist leaves its staged children behind. They must
+      // never be claimed, so discard them with the parent it was abandoning.
+      if ((row.expansion_state ?? 'none') === 'open') {
+        const discarded = this.db
+          .prepare("DELETE FROM checks WHERE parent_id = ? AND status = 'staged'")
+          .run(row.id);
+        this.db
+          .prepare(
+            `UPDATE checks SET expansion_state = NULL, expansion_registered = NULL
+             WHERE id = ?`,
+          )
+          .run(row.id);
+        this.recordEvent('checklist-discarded', lease.workerId, row, {
+          discarded: num(discarded.changes),
+        });
+      }
+
       this.recordEvent('completed', lease.workerId, row, { status });
       this.maybeResumeParent(row.parent_id, now);
 
@@ -857,6 +1090,9 @@ export class Queue {
     if (!parentId) return;
     const parent = this.getRow(parentId);
     if (!parent || parent.status !== 'waiting') return;
+    // Children are only claimable after confirmation; a parent can only reach
+    // `waiting` through commit, so require the confirmed marker explicitly.
+    if ((parent.expansion_state ?? 'none') !== 'confirmed') return;
 
     const pending = this.db
       .prepare(

@@ -161,7 +161,7 @@ function assertStatsWithinLimit(stats: QueueStats): void {
 }
 
 async function testLeaseFencing(dir: string): Promise<void> {
-  log('1/6 lease expiry and stale fencing');
+  log('1/7 lease expiry and stale fencing');
   const dbPath = join(dir, 'lease.sqlite');
   const queue = new Queue({ dbPath, readyLimit: 2, leaseMs: 60 });
   queue.submitRoot({ id: 'lease-root', kind: 'fixture.ok' });
@@ -204,7 +204,7 @@ async function testLeaseFencing(dir: string): Promise<void> {
 }
 
 function testFairnessSecondClaim(dir: string): void {
-  log('2/6 cap=1 cross-tree fairness by second successful claim');
+  log('2/7 cap=1 cross-tree fairness by second successful claim');
   const queue = new Queue({ dbPath: join(dir, 'fairness.sqlite'), readyLimit: 1 });
 
   queue.submitRoot({ id: 'tree-a', kind: 'fixture.tree' });
@@ -235,7 +235,7 @@ function testFairnessSecondClaim(dir: string): void {
 }
 
 async function testLargeChecklistAndLimits(dir: string): Promise<void> {
-  log('3/6 large checklist, paged complete results, and read limits');
+  log('3/7 large checklist, paged complete results, and read limits');
   const dbPath = join(dir, 'limits.sqlite');
   const queue = new Queue({ dbPath, readyLimit: 4, leaseMs: 10_000 });
   queue.submitRoot({
@@ -326,7 +326,7 @@ function assertSingleSlotEvents(events: any[]): void {
 }
 
 async function testSingleProcessCapOneTree(dir: string): Promise<void> {
-  log('4/6 one real worker process, cap=1, multi-layer failure-bearing tree');
+  log('4/7 one real worker process, cap=1, multi-layer failure-bearing tree');
   const dbPath = join(dir, 'single-cap-one.sqlite');
   const queue = new Queue({ dbPath, readyLimit: 1, leaseMs: 10_000 });
   queue.submitRoot({
@@ -393,8 +393,420 @@ interface MarkerRow {
   completed_at: number;
 }
 
+/**
+ * Drive a wide-checklist fixture (single worker, readyLimit=1) through two
+ * interruptions: one while its checklist is still being registered, and one
+ * after confirmation while the tail is still dispatching. Both must recover
+ * through the parent's own lease, reuse finished child results, and deliver
+ * children to the parent in original order, including the business failure.
+ */
+async function testSegmentedHandoverInterruptions(dir: string): Promise<void> {
+  log('5/7 segmented handover: interrupt during registration and after confirmation');
+  const dbPath = join(dir, 'handover.sqlite');
+  const limit = 1;
+  const leaseMs = 1_500;
+
+  // Phase A — interrupt during registration with a real single worker process.
+  // A short-lived worker is SIGKILLed mid-stream while its checklist is only
+  // partially registered. Children stay unclaimable; a replacement worker
+  // reclaims the parent through its own lease, resumes from the durable
+  // registered offset, and the old lease cannot append to or confirm the new
+  // generation's checklist.
+  {
+    const rootId = 'handover-wide-root';
+    const breadth = 12;
+    const shortLeaseMs = 400;
+    const seed = new Queue({ dbPath, readyLimit: limit, leaseMs: shortLeaseMs });
+    seed.submitRoot({
+      id: rootId,
+      kind: 'fixture.wide',
+      input: {
+        breadth,
+        includeFailure: true,
+        delayMs: 0,
+        segment: 1,
+        streamDelayMs: 40,
+        label: rootId,
+      },
+    });
+    seed.close();
+
+    const oldWorker = spawnCli(
+      [
+        'worker',
+        '--db',
+        dbPath,
+        '--fixtures',
+        '--worker-id',
+        'handover-old',
+        '--ready-limit',
+        String(limit),
+        '--lease-ms',
+        String(shortLeaseMs),
+        '--heartbeat-ms',
+        '100',
+        '--poll-ms',
+        '5',
+      ],
+      'handover-old',
+    );
+
+    const midStream = await waitFor(
+      () => {
+        const info = readLeaseRow(dbPath, rootId);
+        if (
+          info &&
+          info.status === 'leased' &&
+          info.worker_id === 'handover-old' &&
+          info.expansion_state === 'open' &&
+          info.expansion_registered >= 1 &&
+          info.expansion_registered < breadth
+        ) {
+          return info;
+        }
+        return null;
+      },
+      { timeoutMs: 10_000, intervalMs: 5, label: 'mid-registration interruption point' },
+    );
+    log(`registration mid-stream: registered=${midStream.expansion_registered}/${breadth}`);
+
+    // Before confirmation nothing is claimable.
+    const counts = rawChildStatusCounts(dbPath, rootId);
+    assert.equal(counts.ready, 0, 'no child is claimable before confirmation');
+    assert.equal(counts.leased, 0, 'no child is leased before confirmation');
+    assert.ok(counts.staged >= 1, 'registered prefix is staged');
+
+    await forceKill([oldWorker]);
+
+    // Wait past the dead worker's lease, then start the replacement.
+    await sleep(shortLeaseMs + 100);
+    const replacement = spawnCli(
+      [
+        'worker',
+        '--db',
+        dbPath,
+        '--fixtures',
+        '--worker-id',
+        'handover-new',
+        '--ready-limit',
+        String(limit),
+        '--lease-ms',
+        String(shortLeaseMs),
+        '--heartbeat-ms',
+        '100',
+        '--poll-ms',
+        '5',
+      ],
+      'handover-new',
+    );
+
+    // The replacement reclaims the still-open parent and keeps the durable
+    // prefix rather than replaying it.
+    const takeover = await waitFor(
+      () => {
+        const info = readLeaseRow(dbPath, rootId);
+        if (info && info.attempt >= 2 && info.worker_id === 'handover-new') return info;
+        return null;
+      },
+      { timeoutMs: 10_000, intervalMs: 10, label: 'replacement takeover' },
+    );
+    assert.ok(
+      takeover.expansion_registered >= midStream.expansion_registered,
+      'durable registered prefix survives into the takeover',
+    );
+
+    // The fenced old generation cannot append to or confirm the new one.
+    const oldLease = {
+      id: rootId,
+      workerId: midStream.worker_id!,
+      leaseToken: midStream.lease_token!,
+      fence: midStream.fence!,
+    };
+    const probe = new Queue({ dbPath, readyLimit: limit, leaseMs: shortLeaseMs });
+    assert.throws(
+      () => probe.appendExpansion(oldLease, [{ key: 'stale-extra', kind: 'fixture.ok', input: {} }]),
+      /LEASE_FENCED|expired|generation/,
+    );
+    assert.throws(() => probe.commitExpansion(oldLease), /LEASE_FENCED|expired|generation/);
+    probe.close();
+
+    await waitFor(
+      async () => {
+        const info = new Queue({ dbPath, readyLimit: limit });
+        try {
+          const progress = info.getProgress(rootId);
+          return progress.status === 'completed' || progress.status === 'failed' ? progress : null;
+        } finally {
+          info.close();
+        }
+      },
+      { timeoutMs: 20_000, intervalMs: 25, label: 'handover phase A terminal' },
+    ).then((progress) => {
+      assert.equal(progress.status, 'completed');
+      const result = progress.result as {
+        receivedChildCount: number;
+        childKeys: string[];
+        ordinals: number[];
+        failedChildren: Array<{ key: string }>;
+      };
+      const expectedKeys = Array.from({ length: breadth }, (_, i) => `w${i}`);
+      expectedKeys.push('required-bad-child');
+      assert.equal(result.receivedChildCount, breadth + 1);
+      assert.deepEqual(result.childKeys, expectedKeys);
+      assert.deepEqual(
+        result.ordinals,
+        expectedKeys.map((_, i) => i),
+      );
+      assert.equal(result.failedChildren.length, 1);
+      assert.equal(result.failedChildren[0]?.key, 'required-bad-child');
+    });
+
+    replacement.child.kill('SIGTERM');
+    await replacement.exited;
+
+    const verifyQueue = new Queue({ dbPath, readyLimit: limit });
+    const stats = verifyQueue.stats(100_000);
+    assert.equal(stats.readyPeak, 1);
+    assertStatsWithinLimit(stats);
+    for (const read of stats.listReads.filter((r) => r.op === 'register')) {
+      assert.ok(read.readCount <= limit, `register read ${read.readCount} > ${limit}`);
+    }
+    assert.ok((stats.listReadCountByOp.register ?? 0) >= breadth, 'registration volume is recorded');
+    assert.ok(
+      stats.distinctClaimWorkers.includes('handover-old') &&
+        stats.distinctClaimWorkers.includes('handover-new'),
+      'both worker generations claimed the parent',
+    );
+    verifyQueue.close();
+  }
+
+  // Phase B — interrupt after confirmation, mid tail dispatch, with the
+  // service and its single worker force-killed together. A restarted service
+  // and worker must keep dispatching the confirmed parent's staged tail,
+  // reuse the child results acknowledged before the kill, and deliver every
+  // child to the parent in original order, including the business failure.
+  {
+    const dbPathB = join(dir, 'handover-tail.sqlite');
+    const rootId = 'handover-tail-root';
+    const breadth = 10;
+    const childDelayMs = 25;
+
+    // Seed a confirmed checklist whose tail is still undispensed, then stop.
+    const seed = new Queue({ dbPath: dbPathB, readyLimit: limit, leaseMs });
+    seed.submitRoot({
+      id: rootId,
+      kind: 'fixture.wide',
+      input: {
+        breadth,
+        includeFailure: true,
+        delayMs: childDelayMs,
+        segment: 1,
+        label: rootId,
+      },
+    });
+    const parent = seed.claim('tail-parent')!;
+    assert.equal(seed.beginExpansion(parent).readLimit, limit);
+    const descriptors: Array<{ key: string; kind: string; input: unknown }> = Array.from(
+      { length: breadth },
+      (_, i) => ({
+        key: `w${i}`,
+        kind: 'fixture.ok',
+        input: { delayMs: childDelayMs },
+      }),
+    );
+    descriptors.push({
+      key: 'required-bad-child',
+      kind: 'fixture.fail',
+      input: { message: 'tail failure' },
+    });
+    for (const descriptor of descriptors) {
+      seed.appendExpansion(parent, [descriptor]);
+    }
+    const commit = seed.commitExpansion(parent);
+    assert.equal(commit.totalChildren, descriptors.length);
+    const confirmed = seed.getProgress(rootId);
+    assert.equal(confirmed.status, 'waiting');
+    assert.ok(confirmed.staged >= 1, 'a confirmed tail is staged before any worker runs');
+    seed.close();
+
+    const leaseForTail = 800;
+    const server = await startSpawnedServer(dbPathB, limit, leaseForTail);
+    const client = new HttpQueueClient(`http://127.0.0.1:${server.port}`);
+    const worker = spawnCli(
+      [
+        'worker',
+        '--http',
+        `http://127.0.0.1:${server.port}`,
+        '--fixtures',
+        '--worker-id',
+        'tail-worker-1',
+        '--poll-ms',
+        '5',
+        '--heartbeat-ms',
+        '200',
+        '--replenish-ms',
+        '20',
+      ],
+      'tail-worker-1',
+    );
+
+    const beforeKill = await waitFor(
+      async () => {
+        const progress = await client.getProgress(rootId);
+        if (progress.terminal >= 2 && progress.staged >= 1) return progress;
+        return null;
+      },
+      { timeoutMs: 20_000, intervalMs: 20, label: 'tail dispatching before SIGKILL' },
+    );
+    assert.equal(beforeKill.status, 'waiting');
+    log(
+      `tail pre-kill: terminal=${beforeKill.terminal}, staged=${beforeKill.staged}, ` +
+        `ready=${beforeKill.ready}, leased=${beforeKill.leased}`,
+    );
+
+    const marker = await readMarkerResult(dbPathB);
+    assert.ok(marker, 'a tail child result is acknowledged before the kill');
+
+    await forceKill([server.process, worker]);
+
+    const restarted = await startSpawnedServer(dbPathB, limit, leaseForTail);
+    const recoveredClient = new HttpQueueClient(`http://127.0.0.1:${restarted.port}`);
+    const recoveryWorker = spawnCli(
+      [
+        'worker',
+        '--http',
+        `http://127.0.0.1:${restarted.port}`,
+        '--fixtures',
+        '--worker-id',
+        'tail-worker-2',
+        '--poll-ms',
+        '10',
+        '--heartbeat-ms',
+        '200',
+        '--replenish-ms',
+        '30',
+      ],
+      'tail-worker-2',
+    );
+
+    const progress = await waitFor(
+      async () => {
+        const value = await recoveredClient.getProgress(rootId).catch(() => null);
+        if (value && (value.status === 'completed' || value.status === 'failed')) return value;
+        return null;
+      },
+      { timeoutMs: 30_000, intervalMs: 50, label: 'tail terminal after restart' },
+    );
+
+    await forceKill([recoveryWorker]);
+    restarted.process.child.kill('SIGTERM');
+    await restarted.process.exited.catch(() => undefined);
+
+    assert.equal(progress.status, 'completed');
+    const result = progress.result as {
+      receivedChildCount: number;
+      childKeys: string[];
+      ordinals: number[];
+      failedChildren: Array<{ key: string }>;
+    };
+    assert.equal(result.receivedChildCount, descriptors.length);
+    assert.deepEqual(result.childKeys, descriptors.map((c) => c.key));
+    assert.deepEqual(result.ordinals, descriptors.map((_, i) => i));
+    assert.equal(result.failedChildren.length, 1);
+    assert.equal(result.failedChildren[0]?.key, 'required-bad-child');
+
+    const finalQueue = new Queue({ dbPath: dbPathB, readyLimit: limit });
+    const stats = finalQueue.stats(100_000);
+    assert.equal(stats.readyPeak, 1);
+    assertStatsWithinLimit(stats);
+    for (const read of stats.listReads.filter((r) => r.op === 'register')) {
+      assert.ok(read.readCount <= limit, `register read ${read.readCount} > ${limit}`);
+    }
+    assert.ok(
+      stats.distinctClaimWorkers.includes('tail-worker-2'),
+      'the restarted worker continued dispatching the tail',
+    );
+    finalQueue.close();
+
+    const rawFinal = new DatabaseSync(dbPathB);
+    rawFinal.exec('PRAGMA busy_timeout=10000');
+    const duplicateRows = rawFinal
+      .prepare('SELECT child_id, COUNT(*) AS c FROM child_results GROUP BY child_id HAVING COUNT(*) > 1')
+      .all();
+    assert.equal(duplicateRows.length, 0, 'each tail child has exactly one result row');
+    const markerAfter = rawFinal
+      .prepare('SELECT completed_at FROM child_results WHERE child_id = ?')
+      .get(marker!.child_id) as { completed_at: number } | undefined;
+    assert.ok(markerAfter, 'pre-kill tail result survives');
+    assert.equal(markerAfter.completed_at, marker!.completed_at, 'pre-kill tail result was reused');
+    rawFinal.close();
+  }
+}
+
+interface LeaseRow {
+  status: string;
+  worker_id: string | null;
+  lease_token: string | null;
+  fence: number | null;
+  attempt: number;
+  expansion_state: string | null;
+  expansion_registered: number;
+}
+
+function readLeaseRow(dbPath: string, id: string): LeaseRow | null {
+  const raw = new DatabaseSync(dbPath);
+  raw.exec('PRAGMA busy_timeout=10000');
+  const row = raw
+    .prepare(
+      `SELECT status, worker_id, lease_token, fence, attempt,
+              expansion_state, expansion_registered
+       FROM checks WHERE id = ?`,
+    )
+    .get(id) as Record<string, unknown> | undefined;
+  raw.close();
+  if (!row) return null;
+  return {
+    status: String(row.status),
+    worker_id: (row.worker_id as string | null) ?? null,
+    lease_token: (row.lease_token as string | null) ?? null,
+    fence: row.fence === null ? null : Number(row.fence),
+    attempt: Number(row.attempt),
+    expansion_state: (row.expansion_state as string | null) ?? null,
+    expansion_registered: Number(row.expansion_registered ?? 0),
+  };
+}
+
+function readMarkerResult(dbPath: string): MarkerRow | undefined {
+  const raw = new DatabaseSync(dbPath);
+  raw.exec('PRAGMA busy_timeout=10000');
+  const row = raw
+    .prepare('SELECT child_id, parent_id, status, completed_at FROM child_results LIMIT 1')
+    .get() as MarkerRow | undefined;
+  raw.close();
+  return row;
+}
+
+function rawChildStatusCounts(
+  dbPath: string,
+  parentId: string,
+): { staged: number; ready: number; leased: number } {
+  const raw = new DatabaseSync(dbPath);
+  raw.exec('PRAGMA busy_timeout=10000');
+  const rows = raw
+    .prepare('SELECT status, COUNT(*) AS n FROM checks WHERE parent_id = ? GROUP BY status')
+    .all(parentId) as Array<{ status: string; n: number | bigint }>;
+  raw.close();
+  const counts = { staged: 0, ready: 0, leased: 0 };
+  for (const row of rows) {
+    const n = typeof row.n === 'bigint' ? Number(row.n) : row.n;
+    if (row.status in counts) counts[row.status as keyof typeof counts] = n;
+  }
+  return counts;
+}
+
+
 async function testMultiProcessKillAndRecovery(dir: string): Promise<void> {
-  log('5/6 three worker processes: multiprocess claiming');
+  log('6/7 three worker processes: multiprocess claiming');
   const dbPath = join(dir, 'recovery.sqlite');
   const limit = 3;
   const server = await startSpawnedServer(dbPath, limit, 1_200);
@@ -454,7 +866,7 @@ async function testMultiProcessKillAndRecovery(dir: string): Promise<void> {
       `workers=${beforeKill.distinctClaimWorkers.join(',')}`,
   );
 
-  log('6/6 SIGKILL server and all workers; restart service and replacement workers');
+  log('7/7 SIGKILL server and all workers; restart service and replacement workers');
   await forceKill([server.process, ...workers]);
 
   // Opening the database after SIGKILL exercises SQLite recovery and proves
@@ -570,6 +982,7 @@ async function main(): Promise<void> {
     await testFairnessSecondClaim(tempRoot);
     await testLargeChecklistAndLimits(tempRoot);
     await testSingleProcessCapOneTree(tempRoot);
+    await testSegmentedHandoverInterruptions(tempRoot);
     await testMultiProcessKillAndRecovery(tempRoot);
 
     const elapsedMs = Date.now() - startedAt;

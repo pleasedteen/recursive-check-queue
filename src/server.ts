@@ -109,7 +109,7 @@ export function startQueueServer(options: QueueServerOptions): Promise<StartedQu
         return;
       }
 
-      const checkMatch = /^\/v1\/checks\/([^/]+)(?:\/(heartbeat|expand|complete|child-results))?$/.exec(path);
+      const checkMatch = /^\/v1\/checks\/([^/]+)(?:\/(heartbeat|expand|begin-expand|append-expand|commit-expand|complete|child-results))?$/.exec(path);
       if (checkMatch) {
         const id = decodeURIComponent(checkMatch[1]!);
         const action = checkMatch[2];
@@ -140,6 +140,18 @@ export function startQueueServer(options: QueueServerOptions): Promise<StartedQu
         }
         if (action === 'expand' && method === 'POST') {
           sendJson(response, 200, queue.expand(lease, { children: body.children ?? [] }));
+          return;
+        }
+        if (action === 'begin-expand' && method === 'POST') {
+          sendJson(response, 200, queue.beginExpansion(lease));
+          return;
+        }
+        if (action === 'append-expand' && method === 'POST') {
+          sendJson(response, 200, queue.appendExpansion(lease, body.children ?? []));
+          return;
+        }
+        if (action === 'commit-expand' && method === 'POST') {
+          sendJson(response, 200, queue.commitExpansion(lease));
           return;
         }
         if (action === 'complete' && method === 'POST') {

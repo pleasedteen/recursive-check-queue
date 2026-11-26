@@ -24,6 +24,15 @@ export interface Lease {
   fence: number;
 }
 
+export type ExpansionStateName = 'none' | 'open' | 'confirmed';
+
+export interface ExpansionStatus {
+  /** none: no checklist handed over yet. open: segments registered, not confirmed. */
+  state: ExpansionStateName;
+  /** Number of descriptors durably registered so far. */
+  registered: number;
+}
+
 export interface ClaimedCheck {
   id: string;
   rootId: string;
@@ -40,6 +49,8 @@ export interface ClaimedCheck {
   leaseToken: string;
   leaseExpiresAt: number;
   claimedAt: number;
+  /** Checklist handover state, useful when resuming an interrupted registration. */
+  expansion: ExpansionStatus;
 }
 
 export interface SerializedError {
@@ -80,10 +91,19 @@ export interface ExpansionAck {
   readLimit: number;
 }
 
+export interface AppendAck {
+  id: string;
+  state: ExpansionStateName;
+  registered: number;
+  added: number;
+  decoded: number;
+  readLimit: number;
+}
+
 export interface ListReadStat {
   id: number;
   at: number;
-  op: 'expand' | 'claim' | 'replenish' | 'result_page';
+  op: 'expand' | 'register' | 'claim' | 'replenish' | 'result_page';
   trigger: string | null;
   parentId: string | null;
   readCount: number;

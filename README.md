@@ -4,12 +4,13 @@ TypeScript + Node.js + SQLite 的本地持久化队列，用于递归展开的�
 
 - 调用方提交根检查、查询进度和最终结果。
 - 多个独立工作进程领取任务、续租、提交子检查清单或结果。
+- 大清单采用分段交接：Handler 可边生成边登记，整份确认前任何子项都不可领取。
 - 一个工作进程同一时刻只有一个检查执行名额；父检查等待子项时进入 `waiting`，不占执行名额。
 - 父检查恢复时，Worker 会按 ordinal 分页读回与清单对应的全部直接子结果；失败子项也是一条终态结果。
-- 展开和完成在同一个 SQLite 写事务内落库，`SIGKILL`、进程崩溃或服务强停后可恢复。
-- 租约到期后任务可被重新领取；旧 worker/fence/token 的状态提交会被拒绝。
-- 全局等待领取的 `ready` 项不超过 `readyLimit`。大清单全部持久化，但展开登记、领取补位、后台补位每次最多读取 `readyLimit` 条清单记录。
-- SQLite 中保存峰值和每次清单读取量，可用 CLI/HTTP/API 核对。
+- 展开、确认和完成在 SQLite 写事务内落库，`SIGKILL`、进程崩溃或服务强停后可恢复；中断的交接可凭父项自己的有效租约接手重试。
+- 租约到期后任务可被重新领取；旧 worker/fence/token 的追加、确认或状态提交都会被拒绝。
+- 全局等待领取的 `ready` 项不超过 `readyLimit`。大清单全部持久化，但登记、领取补位、后台补位每次实际解码/读取的描述项都不超过 `readyLimit`。
+- SQLite 中保存峰值和每次登记/清单读取量，可用 CLI/HTTP/API 核对。
 
 运行环境：Node.js >= 22.5（在 Node.js 22.23 上验证，使用内置 `node:sqlite`，无运行时第三方依赖）。
 
@@ -26,8 +27,11 @@ npm run verify
 2. `readyLimit=1` 时的跨树公平性：新的单步树根在提交后的第二次成功领取内一定被领到。
 3. 120 个子项、`readyLimit=4` 的大清单（30 倍缓冲）：峰值为 4，所有调度读取和结果分页都不超过 4。
 4. 启动一个真实 Worker 子进程，仅一个运行名额、`readyLimit=1`，跑完 4 层检查树，并验证失败子项结果和父项聚合。
-5. 启动 HTTP 队列服务和 3 个 Worker 子进程，验证多进程领取。
-6. 在运行中对服务和全部 Worker 发送 `SIGKILL`，重启服务和新 Worker，核对已确认展开/结果仍在、旧结果未被替换、每个逻辑子项只有一条结果，并且 8 棵 3 层树全部完成。
+5. 单 Worker、`readyLimit=1` 的宽清单夹具，覆盖确认前后的两处中断：
+   - 确认前：Worker 在分段登记途中被 `SIGKILL`，交接停在 `open`，已登记前缀保留；替换 Worker 经父项有效租约接手（新的 fence），凭持久化的已登记偏移续传而非重放，旧租约无法追加或确认。
+   - 确认后：处于 `waiting` 的父项还有尾段未派出时，服务与 Worker 同被 `SIGKILL`；重启后继续派发尾段、复用已完成子结果、父项按原序收齐（含业务失败项）。
+6. 启动 HTTP 队列服务和 3 个 Worker 子进程，验证多进程领取。
+7. 在运行中对服务和全部 Worker 发送 `SIGKILL`，重启服务和新 Worker，核对已确认展开/结果仍在、旧结果未被替换、每个逻辑子项只有一条结果，并且 8 棵 3 层树全部完成。
 
 本机实测 `npm run verify` 总计约 10–13 秒，远低于 80 秒；`npm install` 时间另计。成功时最后一行类似：
 
@@ -47,6 +51,9 @@ npm run verify
 | `fixture.fail` | 直接失败，可传 `{ "message": "..." }`。 |
 | `fixture.slow` | 按 `ms`/`delayMs` 延迟，响应租约丢失的 AbortSignal。 |
 | `fixture.tree` | 递归树。`depth > 0` 时交出 `breadth` 个同类子检查；`depth = 0` 时直接成功。可加 `includeFailure: true` 生成一个确定失败的 `required-bad-child`。恢复时返回完整有序子结果。 |
+| `fixture.wide` | 扁平宽清单：`breadth` 个 `fixture.ok` 子项，`includeFailure: true` 时追加一个失败项；用于分段交接夹具。恢复时返回完整有序子结果。 |
+
+`fixture.tree` 与 `fixture.wide` 都走分段交接（`openChecklist()` → 多次 `append()` → `commit()`），可用 `segment` 控制每段描述项数、`streamDelayMs` 在段间插入可中断延迟以便复现中断。
 
 例如：
 
@@ -172,8 +179,8 @@ node --no-warnings dist/cli.js stats --http http://127.0.0.1:4318
 
 - `readyLimit`：就绪上限。
 - `readyCurrent` / `readyPeak`：当前/峰值就绪项数。
-- `listReads[]`：每次 `expand`、`claim`、`replenish`、`result_page` 的读取条数和操作前后 ready 数。
-- `listReadMaxByOp`：各类操作的最大读取量。
+- `listReads[]`：每次 `register`、`expand`、`claim`、`replenish`、`result_page` 的读取条数和操作前后 ready 数。
+- `listReadMaxByOp`：各类操作的最大读取量（`register` 即每次登记分段实际解码的描述项数）。
 - `claims` / `distinctClaimWorkers`：领取次数和不同 worker。
 - `events[]`：提交、领取、续租、展开、完成、租约丢失等事件。
 
@@ -275,6 +282,23 @@ await ctx.expand([
 return; // handler 结束后父项等待，Worker 名额释放
 ```
 
+大清单建议分段交，边生成边登记（整份确认前子项不可领取）：
+
+```ts
+'compat.wide': async (ctx) => {
+  if (ctx.children) {
+    return { received: ctx.children.length, results: ctx.children };
+  }
+  const writer = await ctx.openChecklist();
+  for (let i = writer.registered; i < total; i += writer.readLimit) {
+    await writer.append(makeDescriptors(i, writer.readLimit));
+    // 中断后可凭 expansion.registered 从断点续传
+  }
+  const ack = await writer.commit(); // 之后子项才可领取
+  return { registered: ack.totalChildren };
+},
+```
+
 ## HTTP 接口
 
 | 方法与路径 | 说明 |
@@ -283,26 +307,37 @@ return; // handler 结束后父项等待，Worker 名额释放
 | `GET /v1/checks/:id` | 获取递归进度；终态时包含 result/error。 |
 | `POST /v1/claims` | body：`{workerId}`；无任务时返回 `204`。 |
 | `POST /v1/checks/:id/heartbeat` | 续租，body 含 `workerId/leaseToken/fence`。 |
-| `POST /v1/checks/:id/expand` | 提交子清单并把父项置为 `waiting`。 |
+| `POST /v1/checks/:id/expand` | 一次性提交整份子清单并确认（数组 Handler 的正常入口）。 |
+| `POST /v1/checks/:id/begin-expand` | 开启分段交接；parent 保持租约。 |
+| `POST /v1/checks/:id/append-expand` | 追加一段描述项，body：`{children}`；单次不超过 `readyLimit`。 |
+| `POST /v1/checks/:id/commit-expand` | 确认整份清单；此后子项才可领取，只提升一段就绪。 |
 | `POST /v1/checks/:id/complete` | 提交 `completed`/`failed` 结果。 |
 | `GET /v1/checks/:id/child-results?afterOrdinal=-1&pageSize=N` | 分页读取完整子结果。 |
 | `POST /v1/replenish` | 手动触发后台补位。 |
-| `GET /v1/stats` | 峰值、状态计数、每次清单读取量、worker 事件。 |
+| `GET /v1/stats` | 峰值、状态计数、每次登记/清单读取量、worker 事件。 |
 | `GET /health` | 健康检查。 |
 
 ## 关键语义
 
 ### 就绪上限和大清单
 
-展开时，所有子描述符都会写入 `checks` 表（状态为 `staged`），但只按 `parent_id, ordinal` 读取并提升最多当前空位数量，且不超过 `readyLimit`。后续由：
+两种交接方式共用同一条持久化路径：
 
-- 成功领取后的同事务补位；
-- 完成后的同事务补位；
-- 服务/Worker 的后台 `replenish`；
+- **一次性（数组）**：Handler 返回 `{ expand: [...] }` 或调用 `await ctx.expand([...])`。整份数组登记后立即确认，仍是数组 Handler 的正常入口。
+- **分段（流式）**：Handler 调用 `await ctx.openChecklist()` 拿到写入器，边生成边 `append(descriptors)`，最后 `commit()`。写入器会自动把过大的数组切成不超过 `readyLimit` 的分段；`writer.registered` 是持久化的已登记偏移。
 
-继续分段读取。相关 SQL 都带 `LIMIT`，实际读取行数写入 `list_read_stats`。
+无论哪种方式，所有子描述符都写入 `checks` 表（状态 `staged`），但：
 
-结果恢复使用独立的 `child_results` 分页读取，每页也不超过 `readyLimit`；Worker 会读完所有页后再调用恢复 handler。因此调度扫描有界，而父项仍能拿到完整结果。
+- 只有 `expansion_state = 'confirmed'` 的父项，其子项才可能被提升/领取；确认前子项一律不可领取；
+- 登记（`register`）、确认（`expand`）、成功领取后的同事务补位、完成后的同事务补位、后台 `replenish` 都带 `LIMIT`，单次实际解码/读取行数不超过 `readyLimit`，并写入 `list_read_stats`；
+- 结果恢复使用独立的 `child_results` 分页读取，每页也不超过 `readyLimit`；Worker 读完所有页后才调用恢复 handler。
+
+### 分段交接的中断恢复
+
+- 交接进行中父项仍是 `leased`，`expansion_state = 'open'`，子项仍 `staged`。
+- 中断（进程崩溃、服务强停或租约过期）后，父项可被重新领取；新租约凭 `expansion_registered` 的持久偏移从断点续传，不会重放已提交分段。
+- 旧租约的 `append-expand`/`commit-expand` 会因 `fence`/`leaseToken` 不匹配被拒绝（`LEASE_FENCED`/HTTP 409），无法追加或确认接手者的清单。
+- 确认（`commit-expand`）后父项进入 `waiting` 并释放名额；即便服务和 Worker 同被 `SIGKILL`，重启后已确认父项的 `staged` 尾段仍会继续派发，已完成子结果被复用，父项按 ordinal 原序收齐（含业务失败项）。
 
 ### 公平性
 
@@ -327,7 +362,7 @@ return; // handler 结束后父项等待，Worker 名额释放
 ### 持久化和 exactly-once 效果
 
 - 数据库使用 WAL、`synchronous=FULL`、`busy_timeout=10000`。
-- 领取、展开、完成、统计更新都在 `BEGIN IMMEDIATE` 事务中。
+- 领取、登记分段、确认、完成、统计更新都在 `BEGIN IMMEDIATE` 事务中。
 - `child_results.child_id` 是主键；每个逻辑子项最多一行结果。
 - 已终态检查不会再次被领取；重启后已有结果直接用于父项聚合。
 - 验证脚本在 `SIGKILL` 前记录一条 `child_results.completed_at`，整树跑完后核对该时间未变。
