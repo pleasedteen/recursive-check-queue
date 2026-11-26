@@ -1,0 +1,29 @@
+{
+  "name": "plugin-check-queue",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent SQLite work queue for recursive plugin compatibility checks",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "plugin-check-queue": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node --no-warnings dist/cli.js serve",
+    "worker": "node --no-warnings dist/cli.js worker --fixtures",
+    "verify": "npm run build && node --no-warnings dist/verify.js",
+    "test": "npm run verify"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
