@@ -40,6 +40,12 @@ export interface ClaimedCheck {
   leaseToken: string;
   leaseExpiresAt: number;
   claimedAt: number;
+  /** Scheduling invariant governing every bounded list access. */
+  readyLimit: number;
+  /** True while this parent holds an open, not-yet-sealed checklist handover. */
+  handoverOpen: boolean;
+  /** Ordinal of the next segment entry (== count already registered). */
+  handoverNextOrdinal: number;
 }
 
 export interface SerializedError {
@@ -72,12 +78,35 @@ export interface CompletionInput {
   error?: SerializedError | Error | unknown;
 }
 
+export interface ExpandInput {
+  /** One segment of the checklist. A single call never carries more than readyLimit entries. */
+  children: CheckDescriptor[];
+  /**
+   * When true this segment seals the handover: the whole checklist becomes
+   * effective and its entries may enter the ready buffer. Omitted/false keeps
+   * the handover open, so no child of this parent can be claimed yet.
+   */
+  finalize?: boolean;
+}
+
 export interface ExpansionAck {
   id: string;
+  /** Total descriptors registered for this parent so far. */
   totalChildren: number;
-  admitted: number;
+  /** Rows newly inserted by this call. */
+  inserted: number;
+  /** Rows already present and idempotently ignored by this call. */
+  ignored: number;
+  /** Entries actually decoded/validated/visited by this call (== children.length). */
   checklistRead: number;
   readLimit: number;
+  /** False until the finalizing call seals the handover. */
+  sealed: boolean;
+  handoverOpen: boolean;
+  /** Ordinal the next segment must start at. */
+  nextOrdinal: number;
+  /** Bounded checklist rows admitted when sealing (0 while open). */
+  admitted: number;
 }
 
 export interface ListReadStat {

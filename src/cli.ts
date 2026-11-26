@@ -122,6 +122,7 @@ async function main(): Promise<void> {
     const pollMs = numberArg(args, 'poll-ms', 40);
     const heartbeatMs = numberArg(args, 'heartbeat-ms', 1_500);
     const replenishMs = numberArg(args, 'replenish-ms', 250);
+    const handoverSegmentDelayMs = numberArg(args, 'handover-segment-delay-ms', 0);
 
     let backend;
     let directQueue: Queue | null = null;
@@ -148,6 +149,7 @@ async function main(): Promise<void> {
       pollMs,
       heartbeatMs,
       replenishMs: boolArg(args, 'background-replenish', true) ? replenishMs : null,
+      handoverSegmentDelayMs,
       onEvent: (event) => printJson(event),
     });
 

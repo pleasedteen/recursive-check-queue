@@ -139,7 +139,14 @@ export function startQueueServer(options: QueueServerOptions): Promise<StartedQu
           return;
         }
         if (action === 'expand' && method === 'POST') {
-          sendJson(response, 200, queue.expand(lease, { children: body.children ?? [] }));
+          sendJson(
+            response,
+            200,
+            queue.expand(lease, {
+              children: body.children ?? [],
+              ...(body.finalize === true ? { finalize: true } : {}),
+            }),
+          );
           return;
         }
         if (action === 'complete' && method === 'POST') {

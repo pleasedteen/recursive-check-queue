@@ -5,6 +5,8 @@ export interface FixtureTreeInput {
   depth?: number;
   breadth?: number;
   delayMs?: number;
+  /** Extra delay only on a check's first activation, before it hands over. */
+  startDelayMs?: number;
   includeFailure?: boolean;
   label?: string;
 }
@@ -47,6 +49,7 @@ function treeChildren(input: FixtureTreeInput): CheckDescriptor[] {
         depth: depth - 1,
         breadth,
         delayMs: input.delayMs ?? 0,
+        startDelayMs: 0,
         includeFailure: false,
         label: `${input.label ?? 'tree'}/b${i}`,
       } satisfies FixtureTreeInput,
@@ -126,6 +129,8 @@ export function createFixtureHandlers(): HandlerMap {
       }
 
       await delay(context, 0.5);
+      const startDelay = (context.input as { startDelayMs?: number }).startDelayMs ?? 0;
+      if (startDelay > 0) await interruptibleDelay(startDelay, context.signal);
 
       // Leaf.
       if (depth <= 0) {

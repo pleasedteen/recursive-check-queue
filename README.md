@@ -3,12 +3,14 @@
 TypeScript + Node.js + SQLite 的本地持久化队列，用于递归展开的插件兼容性检查。
 
 - 调用方提交根检查、查询进度和最终结果。
-- 多个独立工作进程领取任务、续租、提交子检查清单或结果。
+- 多个独立工作进程领取任务、续租、分段提交子检查清单或结果。
 - 一个工作进程同一时刻只有一个检查执行名额；父检查等待子项时进入 `waiting`，不占执行名额。
 - 父检查恢复时，Worker 会按 ordinal 分页读回与清单对应的全部直接子结果；失败子项也是一条终态结果。
+- 超过就绪上限的清单通过现有 `expand` 接口**分段交接**：Worker 每次最多登记 `readyLimit` 条（解码和校验计入），末段带 `finalize` 封口；小清单仍是单次调用。封口前子项一律不可领取。
+- 交接状态持久化：交接进行中强停后，重启可按游标**续交**，也可重发前缀**安全重交**（重复项幂等忽略）；失去租约的 Worker 不能发布任何分段。
 - 展开和完成在同一个 SQLite 写事务内落库，`SIGKILL`、进程崩溃或服务强停后可恢复。
 - 租约到期后任务可被重新领取；旧 worker/fence/token 的状态提交会被拒绝。
-- 全局等待领取的 `ready` 项不超过 `readyLimit`。大清单全部持久化，但展开登记、领取补位、后台补位每次最多读取 `readyLimit` 条清单记录。
+- 全局等待领取的 `ready` 项不超过 `readyLimit`。大清单全部持久化，但展开登记、领取补位、后台补位、结果分页每次实际访问的条目都不超过 `readyLimit`，统计按实际访问量记录。
 - SQLite 中保存峰值和每次清单读取量，可用 CLI/HTTP/API 核对。
 
 运行环境：Node.js >= 22.5（在 Node.js 22.23 上验证，使用内置 `node:sqlite`，无运行时第三方依赖）。
@@ -23,16 +25,18 @@ npm run verify
 `npm run verify` 会先编译，然后自动完成：
 
 1. 短租约到期、重新领取、旧 token/fence 提交被拒绝。
-2. `readyLimit=1` 时的跨树公平性：新的单步树根在提交后的第二次成功领取内一定被领到。
-3. 120 个子项、`readyLimit=4` 的大清单（30 倍缓冲）：峰值为 4，所有调度读取和结果分页都不超过 4。
-4. 启动一个真实 Worker 子进程，仅一个运行名额、`readyLimit=1`，跑完 4 层检查树，并验证失败子项结果和父项聚合。
-5. 启动 HTTP 队列服务和 3 个 Worker 子进程，验证多进程领取。
-6. 在运行中对服务和全部 Worker 发送 `SIGKILL`，重启服务和新 Worker，核对已确认展开/结果仍在、旧结果未被替换、每个逻辑子项只有一条结果，并且 8 棵 3 层树全部完成。
+2. `readyLimit=1` 时的跨树公平性：新的单步树根在提交后的第二次成功领取内一定被领到；交接封口前子项不可领取。
+3. 120 个子项、`readyLimit=4` 的大清单（30 倍缓冲）：分 30 段交接，峰值为 4，所有调度读取和结果分页都不超过 4。
+4. 分段交接协议：段大小上限、封口前不可见、失去租约的发布被 fencing、按游标续交、强停后安全重交（前缀幂等忽略）、空清单不卡死父项。
+5. 单 Worker、`readyLimit=1` 的本地宽清单递归树：交接前、交接中（未封口）、封口后分别 `SIGKILL`，验证续交/重交、未派发条目保留、结果复用且每个逻辑子项只计一次、实际读取量恒为 1。
+6. 启动一个真实 Worker 子进程，仅一个运行名额、`readyLimit=1`，跑完 4 层检查树，并验证失败子项结果和父项聚合。
+7. 启动 HTTP 队列服务和 3 个 Worker 子进程，验证多进程领取。
+8. 在运行中对服务和全部 Worker 发送 `SIGKILL`，重启服务和新 Worker，核对已确认展开/结果仍在、旧结果未被替换、每个逻辑子项只有一条结果，并且 8 棵 3 层树全部完成。
 
-本机实测 `npm run verify` 总计约 10–13 秒，远低于 80 秒；`npm install` 时间另计。成功时最后一行类似：
+本机实测 `npm run verify` 总计约 8 秒，远低于 80 秒；`npm install` 时间另计。成功时最后一行类似：
 
 ```text
-[verify 5.9s] PASS: all persistence, recovery, fairness, and limit checks passed in 5.9s
+[verify 7.6s] PASS: all persistence, recovery, fairness, and limit checks passed in 7.6s
 ```
 
 失败时临时数据库目录会保留，日志会打印该目录。
@@ -275,6 +279,8 @@ await ctx.expand([
 return; // handler 结束后父项等待，Worker 名额释放
 ```
 
+传给 `expand` 的清单可以任意长：Worker 运行时会自动按 `readyLimit` 切成多段、逐段调用底层接口并在末段封口，handler 无需关心分段。直接使用 `Queue.expand` 时则需要自行把 `children` 控制在每段至多 `readyLimit` 条，并在最后一段传 `{ finalize: true }`。
+
 ## HTTP 接口
 
 | 方法与路径 | 说明 |
@@ -283,7 +289,7 @@ return; // handler 结束后父项等待，Worker 名额释放
 | `GET /v1/checks/:id` | 获取递归进度；终态时包含 result/error。 |
 | `POST /v1/claims` | body：`{workerId}`；无任务时返回 `204`。 |
 | `POST /v1/checks/:id/heartbeat` | 续租，body 含 `workerId/leaseToken/fence`。 |
-| `POST /v1/checks/:id/expand` | 提交子清单并把父项置为 `waiting`。 |
+| `POST /v1/checks/:id/expand` | 交接一段子清单，body：`{workerId, leaseToken, fence, children, finalize?}`。每段 `children` 不超过 `readyLimit`；`finalize:true` 的末段封口并把父项置为 `waiting`。返回 `sealed/nextOrdinal/inserted/ignored`。 |
 | `POST /v1/checks/:id/complete` | 提交 `completed`/`failed` 结果。 |
 | `GET /v1/checks/:id/child-results?afterOrdinal=-1&pageSize=N` | 分页读取完整子结果。 |
 | `POST /v1/replenish` | 手动触发后台补位。 |
@@ -292,17 +298,27 @@ return; // handler 结束后父项等待，Worker 名额释放
 
 ## 关键语义
 
-### 就绪上限和大清单
+### 就绪上限、大清单与分段交接
 
-展开时，所有子描述符都会写入 `checks` 表（状态为 `staged`），但只按 `parent_id, ordinal` 读取并提升最多当前空位数量，且不超过 `readyLimit`。后续由：
+Worker 通过现有 `expand` 接口交接清单。内置 Worker 运行时会把任意长度的清单自动切成每段至多 `readyLimit` 条，逐段登记，并在最后一段带 `finalize` 封口；小清单仍是一次调用完成，原有 `{ expand: [...] }` / `ctx.expand([...])` 用法不变。
+
+**交接生命周期：**
+
+1. 第一段到达时，父项打开一个 handover（`handover_open=1`），但保持 `leased`，租约、心跳和 fencing 在整个交接期间持续有效。
+2. 后续每段都先做解码和校验（每段访问的条目数计入统计且不超过 `readyLimit`），再以 `INSERT OR IGNORE` 落库为 `staged`。这些子项在调度扫描中被显式排除（部分索引 `idx_checks_admittable`），**封口生效前一律不可领取**。
+3. 带 `finalize` 的末段在一个写事务内把整份清单 `handover_open` 翻为 0、父项置 `waiting` 并释放租约，随后做一次有界提升。空清单会让父项立即转为可恢复，不会卡在 `waiting`。
+
+**强停与恢复：** handover 状态和已登记前缀都已落库。交接进行中 `SIGKILL` 后，重新领取该父项的 Worker 会看到 `handoverOpen/handoverNextOrdinal`，从游标**续交**剩余段；重发已登记前缀也安全——重复项按稳定 key 幂等忽略（`ignored` 计数），ordinal 顺序不变，每个逻辑子项只落一条。
+
+**有界调度：** 封口后，子项按 `parent_id, ordinal` 被有界提升，每次读取不超过当前空位且不超过 `readyLimit`。后续由：
 
 - 成功领取后的同事务补位；
 - 完成后的同事务补位；
 - 服务/Worker 的后台 `replenish`；
 
-继续分段读取。相关 SQL 都带 `LIMIT`，实际读取行数写入 `list_read_stats`。
+继续分段读取。相关 SQL 都带 `LIMIT`，实际读取行数写入 `list_read_stats`（`expand`/`claim`/`replenish`/`result_page` 各自独立记录，单条读取量恒不超过 `readyLimit`）。
 
-结果恢复使用独立的 `child_results` 分页读取，每页也不超过 `readyLimit`；Worker 会读完所有页后再调用恢复 handler。因此调度扫描有界，而父项仍能拿到完整结果。
+结果恢复使用独立的 `child_results` 分页读取，每页也不超过 `readyLimit`；Worker 会读完所有页后再调用恢复 handler。因此调度扫描有界，而父项仍能拿到完整、按 ordinal 有序的结果；`child_results.child_id` 为主键，每个逻辑子项最多一条结果。
 
 ### 公平性
 

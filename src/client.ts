@@ -1,6 +1,7 @@
 import type {
   ChildResult,
   ClaimedCheck,
+  ExpansionAck,
   Lease,
   Progress,
   QueueStats,
@@ -76,12 +77,17 @@ export class HttpQueueClient implements WorkerBackend {
     });
   }
 
-  async expand(lease: Lease, children: CheckDescriptor[]): Promise<unknown> {
+  async expand(
+    lease: Lease,
+    children: CheckDescriptor[],
+    options?: { finalize?: boolean },
+  ): Promise<ExpansionAck> {
     return this.post(`/v1/checks/${encodeURIComponent(lease.id)}/expand`, {
       workerId: lease.workerId,
       leaseToken: lease.leaseToken,
       fence: lease.fence,
       children,
+      ...(options?.finalize ? { finalize: true } : {}),
     });
   }
 

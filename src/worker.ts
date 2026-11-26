@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   ChildResult,
   ClaimedCheck,
+  ExpansionAck,
   Lease,
   LeaseFencedError,
   serializeError,
@@ -13,7 +14,11 @@ import { Queue } from './queue.js';
 export interface WorkerBackend {
   claim(workerId: string): Promise<ClaimedCheck | null>;
   heartbeat(lease: Lease): Promise<unknown>;
-  expand(lease: Lease, children: CheckDescriptor[]): Promise<unknown>;
+  expand(
+    lease: Lease,
+    children: CheckDescriptor[],
+    options?: { finalize?: boolean },
+  ): Promise<ExpansionAck>;
   complete(
     lease: Lease,
     outcome: { status: 'completed' | 'failed'; result?: unknown; error?: unknown },
@@ -41,6 +46,8 @@ export interface WorkerOptions {
   heartbeatMs?: number;
   replenishMs?: number | null;
   leaseMs?: number;
+  /** Pause between handover segments (backpressure / observability). */
+  handoverSegmentDelayMs?: number;
   onEvent?: (event: Record<string, unknown>) => void;
 }
 
@@ -65,8 +72,12 @@ export class DirectQueueBackend implements WorkerBackend {
     return this.queue.heartbeat(lease);
   }
 
-  async expand(lease: Lease, children: CheckDescriptor[]): Promise<unknown> {
-    return this.queue.expand(lease, { children });
+  async expand(
+    lease: Lease,
+    children: CheckDescriptor[],
+    options?: { finalize?: boolean },
+  ): Promise<ExpansionAck> {
+    return this.queue.expand(lease, { children, ...(options?.finalize ? { finalize: true } : {}) });
   }
 
   async complete(
@@ -107,6 +118,7 @@ export class Worker {
   private readonly pollMs: number;
   private readonly heartbeatMs: number;
   private readonly replenishMs: number | null;
+  private readonly handoverSegmentDelayMs: number;
   private readonly onEvent: (event: Record<string, unknown>) => void;
   private stopping = false;
   private active: ClaimedCheck | null = null;
@@ -121,6 +133,7 @@ export class Worker {
     this.pollMs = options.pollMs ?? 50;
     this.heartbeatMs = options.heartbeatMs ?? 2_000;
     this.replenishMs = options.replenishMs ?? null;
+    this.handoverSegmentDelayMs = Math.max(0, options.handoverSegmentDelayMs ?? 0);
     this.onEvent = options.onEvent ?? (() => undefined);
   }
 
@@ -227,7 +240,7 @@ export class Worker {
       signal: controller.signal,
       expand: async (descriptors: CheckDescriptor[]) => {
         if (expanded) throw new Error('a check can only hand over one checklist');
-        const ack = await this.backend.expand(job, descriptors);
+        const ack = await this.handOverChecklist(job, descriptors, controller);
         expanded = true;
         return ack;
       },
@@ -252,7 +265,7 @@ export class Worker {
       if (leaseLost) return;
 
       if (!expanded && isExpandOutput(output)) {
-        await this.backend.expand(job, output.expand);
+        await this.handOverChecklist(job, output.expand, controller);
         expanded = true;
       }
 
@@ -282,6 +295,89 @@ export class Worker {
     } finally {
       clearInterval(heartbeatTimer);
     }
+  }
+
+  /**
+   * Hand a whole checklist over through the existing expand interface, in
+   * bounded segments of at most the queue's readyLimit. Small lists still use
+   * a single call. The final segment seals the handover.
+   *
+   * If the lease was reclaimed while an earlier handover was open (e.g. after
+   * a hard stop mid-handover), the restarted worker resumes from the durable
+   * cursor; the skipped prefix is already registered. Re-sending a prefix is
+   * also accepted because the queue ignores duplicate entries idempotently.
+   */
+  private async handOverChecklist(
+    job: ClaimedCheck,
+    descriptors: CheckDescriptor[],
+    controller: AbortController,
+  ): Promise<ExpansionAck> {
+    const limit = Math.max(1, job.readyLimit ?? 1);
+    let ack: ExpansionAck | null = null;
+
+    // Resume mode: an open handover survived a crash/lease loss. Skip the
+    // prefix the previous execution already durably registered.
+    const start = job.handoverOpen ? Math.min(job.handoverNextOrdinal, descriptors.length) : 0;
+    const pending = descriptors.slice(start);
+
+    if (job.handoverOpen) {
+      this.onEvent({
+        type: 'handover-resume',
+        workerId: this.workerId,
+        checkId: job.id,
+        resumeFromOrdinal: start,
+        totalDescriptors: descriptors.length,
+      });
+    }
+
+    if (pending.length === 0) {
+      // Nothing left to register (or an empty checklist): seal immediately.
+      ack = await this.backend.expand(job, [], { finalize: true });
+      this.onEvent({
+        type: 'handover-sealed',
+        workerId: this.workerId,
+        checkId: job.id,
+        segments: 0,
+        totalChildren: ack.totalChildren,
+        admitted: ack.admitted,
+      });
+      return ack;
+    }
+
+    let segmentIndex = 0;
+    for (let offset = 0; offset < pending.length; offset += limit) {
+      if (controller.signal.aborted) {
+        throw new LeaseFencedError('lease lost while handing over checklist');
+      }
+      const segment = pending.slice(offset, offset + limit);
+      const isLast = offset + limit >= pending.length;
+      ack = await this.backend.expand(job, segment, { finalize: isLast });
+      segmentIndex += 1;
+      this.onEvent({
+        type: 'handover-segment',
+        workerId: this.workerId,
+        checkId: job.id,
+        segment: segmentIndex,
+        segmentSize: segment.length,
+        nextOrdinal: ack.nextOrdinal,
+        sealed: ack.sealed,
+        ignored: ack.ignored,
+      });
+      if (!isLast && this.handoverSegmentDelayMs > 0) {
+        await sleep(this.handoverSegmentDelayMs);
+      }
+    }
+
+    const finalAck = ack!;
+    this.onEvent({
+      type: 'handover-sealed',
+      workerId: this.workerId,
+      checkId: job.id,
+      segments: segmentIndex,
+      totalChildren: finalAck.totalChildren,
+      admitted: finalAck.admitted,
+    });
+    return finalAck;
   }
 
   private async safeFail(job: ClaimedCheck, error: unknown): Promise<void> {

@@ -8,6 +8,7 @@ import {
   ClaimedCheck,
   CompletionInput,
   ExpansionAck,
+  ExpandInput,
   Lease,
   LeaseFencedError,
   ListReadStat,
@@ -49,6 +50,7 @@ interface CheckRow {
   submitted_seq: number | bigint | null;
   admission_seq: number | bigint | null;
   ready_since: number | bigint | null;
+  handover_open: number | bigint;
   created_at: number | bigint;
   updated_at: number | bigint;
 }
@@ -136,6 +138,7 @@ export class Queue {
         submitted_seq INTEGER,
         admission_seq INTEGER,
         ready_since INTEGER,
+        handover_open INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(parent_id, child_key)
@@ -189,6 +192,21 @@ export class Queue {
       CREATE INDEX IF NOT EXISTS idx_events_worker
         ON worker_events(worker_id, event);
     `);
+
+    // Migration for databases created before segmented checklists existed.
+    const checkColumns = this.db.prepare('PRAGMA table_info(checks)').all() as Array<{
+      name: string;
+    }>;
+    if (!checkColumns.some((column) => column.name === 'handover_open')) {
+      this.db.exec('ALTER TABLE checks ADD COLUMN handover_open INTEGER NOT NULL DEFAULT 0');
+    }
+    // Entries of an open handover stay staged but must be invisible to the
+    // scheduler until the finalizing segment seals the checklist.
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_checks_admittable
+        ON checks(status, parent_id, ordinal)
+        WHERE status = 'staged' AND handover_open = 0`,
+    );
 
     const existingLimit = this.getMeta('ready_limit');
     if (existingLimit === null) {
@@ -335,7 +353,15 @@ export class Queue {
     return row;
   }
 
+  private countChildren(parentId: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM checks WHERE parent_id = ?')
+      .get(parentId) as { n: number | bigint };
+    return num(row.n);
+  }
+
   private toClaimed(row: CheckRow): ClaimedCheck {
+    const handoverOpen = num(row.handover_open) === 1;
     return {
       id: row.id,
       rootId: row.root_id,
@@ -352,6 +378,9 @@ export class Queue {
       leaseToken: row.lease_token ?? '',
       leaseExpiresAt: num(row.lease_expires_at),
       claimedAt: this.now(),
+      readyLimit: this.readyLimit,
+      handoverOpen,
+      handoverNextOrdinal: handoverOpen ? this.countChildren(row.id) : 0,
     };
   }
 
@@ -454,7 +483,8 @@ export class Queue {
 
   /**
    * Read at most budget.remaining checklist rows and admit them.
-   * The budget is shared by all reads in one external operation.
+   * The budget is shared by all reads in one external operation. Children of
+   * an open (not-yet-sealed) handover are invisible until the final segment.
    */
   private admitChecklistChildren(budget: Budget): { readCount: number; ids: string[] } {
     const free = this.readyLimit - this.readyCount();
@@ -466,9 +496,11 @@ export class Queue {
         `SELECT c.id
          FROM checks c
          JOIN checks r ON r.id = c.root_id
+         JOIN checks p ON p.id = c.parent_id
          WHERE c.status = 'staged'
            AND c.parent_id IS NOT NULL
            AND c.resumable = 0
+           AND p.handover_open = 0
          ORDER BY r.submitted_seq ASC,
                   c.created_at ASC,
                   c.parent_id ASC,
@@ -655,105 +687,188 @@ export class Queue {
   }
 
   /**
-   * Durably register a child checklist and release the parent's execution slot.
-   * All descriptors are persisted; only one bounded segment is made ready now.
+   * Validate one handover segment. These checks run before any write so an
+   * oversized segment never partially lands. Every descriptor here counts as
+   * an actual access and is bounded by readyLimit.
    */
-  expand(lease: Lease, input: { children: CheckDescriptor[] }): ExpansionAck {
-    const children = input.children ?? [];
+  private validateSegment(children: CheckDescriptor[]): void {
     if (!Array.isArray(children)) throw new ValidationError('children must be an array');
+    if (children.length > this.readyLimit) {
+      throw new ValidationError(
+        `segment size ${children.length} exceeds readyLimit ${this.readyLimit}; hand the checklist over in segments`,
+      );
+    }
+    children.forEach((child, index) => {
+      if (!child || !child.kind) {
+        throw new ValidationError(`child at ordinal ${index} lacks kind`);
+      }
+    });
+  }
+
+  /**
+   * Durably register one bounded segment of a child checklist and release the
+   * parent's execution slot. While the handover is open the parent stays
+   * `leased` (heartbeats/fencing still apply) and its children cannot be
+   * claimed. The finalizing segment seals the checklist; only then may its
+   * entries enter the ready buffer through the bounded scheduler.
+   *
+   * Re-sending already registered entries is idempotently ignored, so a
+   * worker can continue from the cursor (handoverNextOrdinal) or safely
+   * re-hand the whole list after a crash/restart.
+   */
+  expand(lease: Lease, input: ExpandInput): ExpansionAck {
+    const children = input.children ?? [];
+    const finalize = input.finalize === true;
+    this.validateSegment(children);
 
     return this.withTx(() => {
       const parent = this.assertActiveLease(lease);
       const readyBefore = this.readyCount();
       const now = this.now();
 
-      this.db
-        .prepare(
-          `UPDATE checks
-             SET status = 'waiting',
-                 lease_token = NULL,
-                 lease_expires_at = NULL,
-                 updated_at = ?
-           WHERE id = ?`,
-        )
-        .run(now, parent.id);
+      if (parent.status !== 'leased') {
+        throw new LeaseFencedError(
+          `cannot expand ${parent.id}: check is ${parent.status}, no active handover lease`,
+        );
+      }
+      if (num(parent.resumable) === 1) {
+        throw new ValidationError(`check ${parent.id} already handed over a checklist and is resumable`);
+      }
+      const wasOpen = num(parent.handover_open) === 1;
+      if (!wasOpen && num(this.countChildren(parent.id)) > 0) {
+        throw new ValidationError(`check ${parent.id} already has a sealed checklist`);
+      }
+      if (wasOpen && !finalize && children.length === 0) {
+        throw new ValidationError('an open handover segment must contain entries or finalize');
+      }
 
+      // First segment: open the handover. The parent remains leased, so the
+      // execution lease and its fence keep protecting every later segment.
+      if (!wasOpen) {
+        this.db
+          .prepare(
+            `UPDATE checks SET handover_open = 1, updated_at = ? WHERE id = ? AND handover_open = 0`,
+          )
+          .run(now, parent.id);
+      }
+
+      const baseOrdinal = this.countChildren(parent.id);
       const insert = this.db.prepare(
         `INSERT OR IGNORE INTO checks(
            id, root_id, parent_id, child_key, ordinal, kind, input_json,
-           status, resumable, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', 0, ?, ?)`,
+           status, resumable, handover_open, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', 0, 1, ?, ?)`,
       );
 
+      let inserted = 0;
+      let ignored = 0;
       children.forEach((child, index) => {
-        if (!child.kind) throw new ValidationError(`child at ordinal ${index} lacks kind`);
-        const key = child.key ?? String(index);
+        const key = child.key ?? String(baseOrdinal + index);
         const id = child.id ?? randomUUID();
-        insert.run(
+        const result = insert.run(
           id,
           parent.root_id,
           parent.id,
           key,
-          index,
+          baseOrdinal + index,
           child.kind,
           JSON.stringify(child.input ?? null),
           now,
           now,
         );
+        if (num(result.changes) === 1) inserted += 1;
+        else ignored += 1;
       });
 
-      // If capacity exists, priority work should enter first. Under the
-      // scheduler invariant a pending priority item implies a full buffer, so
-      // this normally changes nothing here.
-      this.admitPriorityItems();
-
-      const free = this.readyLimit - this.readyCount();
-      const pageLimit = Math.max(0, Math.min(this.readyLimit, free));
-      let readRows: Array<{ id: string }> = [];
-      if (pageLimit > 0) {
-        readRows = this.db
-          .prepare(
-            `SELECT id FROM checks
-             WHERE parent_id = ? AND status = 'staged'
-             ORDER BY ordinal ASC
-             LIMIT ?`,
-          )
-          .all(parent.id, pageLimit) as Array<{ id: string }>;
-        for (const row of readRows) {
-          this.db
-            .prepare(
-              `UPDATE checks SET status = 'ready', ready_since = ?, updated_at = ?
-               WHERE id = ? AND status = 'staged'`,
-            )
-            .run(now, now, row.id);
-        }
-      }
-
-      this.updatePeak();
-      const totalChildrenRow = this.db
-        .prepare('SELECT COUNT(*) AS n FROM checks WHERE parent_id = ?')
-        .get(parent.id) as { n: number | bigint };
-      const totalChildren = num(totalChildrenRow.n);
-
+      const totalChildren = this.countChildren(parent.id);
       this.recordListRead({
         op: 'expand',
-        trigger: 'register',
+        trigger: wasOpen ? 'segment' : 'register',
         parentId: parent.id,
-        readCount: readRows.length,
+        readCount: children.length,
         readyBefore,
-        detail: { requested: children.length, totalChildren },
-      });
-      this.recordEvent('expanded', lease.workerId, parent, {
-        children: children.length,
-        admitted: readRows.length,
+        detail: {
+          segmentSize: children.length,
+          inserted,
+          ignored,
+          finalize,
+          totalChildren,
+        },
       });
 
+      let sealed = false;
+      let admitted = 0;
+      if (finalize) {
+        // Seal: flip the whole checklist effective in one durable step, then
+        // release the lease and move the parent to waiting as before.
+        this.db
+          .prepare(
+            `UPDATE checks SET handover_open = 0, updated_at = ?
+             WHERE parent_id = ? AND handover_open = 1`,
+          )
+          .run(now, parent.id);
+        this.db
+          .prepare(
+            `UPDATE checks
+               SET status = 'waiting',
+                   handover_open = 0,
+                   lease_token = NULL,
+                   lease_expires_at = NULL,
+                   updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(now, parent.id);
+        sealed = true;
+
+        // An empty checklist has no child completion to retrigger a resume,
+        // so make the parent immediately resumable here. For non-empty lists
+        // this is a no-op until every child reaches a terminal state. It runs
+        // before admission so an empty-list parent can enter ready at once.
+        this.maybeResumeParent(parent.id, now);
+
+        // One bounded admission pass, recorded as its own list read so no
+        // single recorded access ever exceeds readyLimit.
+        const admitReadyBefore = this.readyCount();
+        this.admitPriorityItems();
+        const budget: Budget = { used: 0, max: this.readyLimit };
+        const page = this.admitChecklistChildren(budget);
+        admitted = page.ids.length;
+        if (budget.used > 0 || admitted > 0) {
+          this.recordListRead({
+            op: 'replenish',
+            trigger: 'handover-seal',
+            parentId: parent.id,
+            readCount: budget.used,
+            readyBefore: admitReadyBefore,
+            detail: { admitted: page.ids },
+          });
+        }
+        this.updatePeak();
+        this.recordEvent('expanded', lease.workerId, parent, {
+          children: totalChildren,
+          admitted,
+          segmented: true,
+        });
+      } else {
+        this.recordEvent('handover-segment', lease.workerId, parent, {
+          inserted,
+          ignored,
+          totalChildren,
+        });
+      }
+
+      const nextOrdinal = totalChildren;
       return {
         id: parent.id,
         totalChildren,
-        admitted: readRows.length,
-        checklistRead: readRows.length,
+        inserted,
+        ignored,
+        checklistRead: children.length,
         readLimit: this.readyLimit,
+        sealed,
+        handoverOpen: !sealed,
+        nextOrdinal,
+        admitted,
       };
     });
   }
