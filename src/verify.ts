@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { HttpQueueClient } from './client.js';
 import { createFixtureHandlers } from './fixtures.js';
 import { Queue } from './queue.js';
+import { startQueueServer } from './server.js';
 import type { QueueStats } from './types.js';
 import { DirectQueueBackend, Worker, sleep } from './worker.js';
 
@@ -161,7 +162,7 @@ function assertStatsWithinLimit(stats: QueueStats): void {
 }
 
 async function testLeaseFencing(dir: string): Promise<void> {
-  log('1/6 lease expiry and stale fencing');
+  log('1/9 lease expiry and stale fencing');
   const dbPath = join(dir, 'lease.sqlite');
   const queue = new Queue({ dbPath, readyLimit: 2, leaseMs: 60 });
   queue.submitRoot({ id: 'lease-root', kind: 'fixture.ok' });
@@ -204,7 +205,7 @@ async function testLeaseFencing(dir: string): Promise<void> {
 }
 
 function testFairnessSecondClaim(dir: string): void {
-  log('2/6 cap=1 cross-tree fairness by second successful claim');
+  log('2/9 cap=1 cross-tree fairness by second successful claim');
   const queue = new Queue({ dbPath: join(dir, 'fairness.sqlite'), readyLimit: 1 });
 
   queue.submitRoot({ id: 'tree-a', kind: 'fixture.tree' });
@@ -235,7 +236,7 @@ function testFairnessSecondClaim(dir: string): void {
 }
 
 async function testLargeChecklistAndLimits(dir: string): Promise<void> {
-  log('3/6 large checklist, paged complete results, and read limits');
+  log('3/9 large checklist, paged complete results, and read limits');
   const dbPath = join(dir, 'limits.sqlite');
   const queue = new Queue({ dbPath, readyLimit: 4, leaseMs: 10_000 });
   queue.submitRoot({
@@ -269,7 +270,8 @@ async function testLargeChecklistAndLimits(dir: string): Promise<void> {
   log(
     `limit stats: readyPeak=${stats.readyPeak}, maxListReadsByOp=${JSON.stringify(
       stats.listReadMaxByOp,
-    )}, resultPages=${stats.listReadCountByOp.result_page ?? 0}`,
+    )}, resultPages=${stats.listReadCountByOp.result_page ?? 0} ` +
+      '(实际读取量 actual checklist reads all <= readyLimit)',
   );
   queue.close();
 
@@ -306,6 +308,154 @@ async function testLargeChecklistAndLimits(dir: string): Promise<void> {
   opQueue.close();
 }
 
+async function testHandoffRetryDirect(dir: string): Promise<void> {
+  log('4/9 handoff retry / 交接重试: same generation replays ack, registers once, stale generation fenced');
+
+  // Small checklist against a larger cap: stats must report the rows actually
+  // read (2), not the LIMIT/page capacity (4).
+  const dbPath = join(dir, 'handoff-retry.sqlite');
+  const queue = new Queue({ dbPath, readyLimit: 4, leaseMs: 60_000 });
+  queue.submitRoot({ id: 'hr-root', kind: 'fixture.tree' });
+  const job = queue.claim('hr-worker')!;
+  assert.ok(job);
+
+  const two = [
+    { key: 'a', kind: 'fixture.ok' },
+    { key: 'b', kind: 'fixture.ok' },
+  ];
+  const ack1 = queue.expand(job, { children: two });
+  assert.equal(ack1.totalChildren, 2);
+  assert.equal(ack1.checklistRead, 2, 'ack reports actual read rows');
+  const expandRead = queue
+    .stats(100_000)
+    .listReads.filter((s) => s.op === 'expand' && s.parentId === 'hr-root')
+    .at(-1);
+  assert.equal(expandRead?.readCount, 2, 'stat reports actual read rows rather than the LIMIT');
+
+  // Simulate a lost response packet: the exact same lease generation retries.
+  const ack2 = queue.expand(job, { children: two });
+  assert.deepEqual(ack2, ack1, 'retry replays the original handoff ack');
+  const ack3 = queue.expand(job, { children: two });
+  assert.deepEqual(ack3, ack1);
+
+  const raw = new DatabaseSync(dbPath);
+  raw.exec('PRAGMA busy_timeout=10000');
+  const childCount = raw
+    .prepare("SELECT COUNT(*) AS n FROM checks WHERE parent_id = 'hr-root'")
+    .get() as { n: number | bigint };
+  assert.equal(Number(childCount.n), 2, 'retry must not register duplicate children');
+  const receiptCount = raw
+    .prepare("SELECT COUNT(*) AS n FROM operation_receipts WHERE op = 'expand'")
+    .get() as { n: number | bigint };
+  assert.equal(Number(receiptCount.n), 1, 'exactly one durable handoff receipt');
+
+  // A process presenting a stale/foreign lease generation cannot replay,
+  // write, or dispatch through this handoff.
+  assert.throws(
+    () => queue.expand({ ...job, leaseToken: 'forged-token' }, { children: two }),
+    /LEASE_FENCED|generation/,
+  );
+  assert.throws(
+    () => queue.expand({ ...job, workerId: 'imposter' }, { children: two }),
+    /LEASE_FENCED|generation/,
+  );
+  assert.throws(
+    () => queue.expand({ ...job, fence: job.fence + 1 }, { children: two }),
+    /LEASE_FENCED|generation/,
+  );
+  const childCountAfterRejects = raw
+    .prepare("SELECT COUNT(*) AS n FROM checks WHERE parent_id = 'hr-root'")
+    .get() as { n: number | bigint };
+  assert.equal(Number(childCountAfterRejects.n), 2);
+  raw.close();
+  assertStatsWithinLimit(queue.stats(100_000));
+  queue.close();
+
+  // A never-committed expansion whose lease has since expired must be rejected;
+  // the reclaimed generation can then hand off exactly once.
+  const stalePath = join(dir, 'handoff-stale.sqlite');
+  const stale = new Queue({ dbPath: stalePath, readyLimit: 2, leaseMs: 40 });
+  stale.submitRoot({ id: 'stale-root', kind: 'fixture.tree' });
+  const oldJob = stale.claim('old-worker')!;
+  await sleep(70);
+  assert.throws(
+    () => stale.expand(oldJob, { children: [{ key: 'x', kind: 'fixture.ok' }] }),
+    /LEASE_FENCED|expired|generation/,
+    'lease-lost process cannot write/dispatch',
+  );
+  const reclaimed = stale.claim('new-worker')!;
+  assert.equal(reclaimed.id, 'stale-root');
+  assert.equal(reclaimed.fence, oldJob.fence + 1);
+  const freshAck = stale.expand(reclaimed, {
+    children: Array.from({ length: 9 }, (_, i) => ({ key: `s${i}`, kind: 'fixture.ok' })),
+  });
+  assert.equal(freshAck.totalChildren, 9);
+  assert.equal(stale.expand(reclaimed, { children: [] }).totalChildren, 9);
+  assertStatsWithinLimit(stale.stats(100_000));
+  stale.close();
+}
+
+async function testHttpHandoffRetry(dir: string): Promise<void> {
+  log('5/9 handoff retry over HTTP after a lost response packet');
+  const dbPath = join(dir, 'http-handoff-retry.sqlite');
+  const handle = await startQueueServer({ dbPath, port: 0, readyLimit: 2, leaseMs: 60_000 });
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    const client = new HttpQueueClient(base);
+    await client.submitRoot({ id: 'http-hr', kind: 'fixture.tree' });
+    const job = await client.claim('http-retry-worker');
+    assert.ok(job);
+
+    const children = Array.from({ length: 25 }, (_, i) => ({
+      key: `h${i}`,
+      kind: 'fixture.ok',
+      input: { i },
+    }));
+    const postExpand = async (lease: {
+      workerId: string;
+      leaseToken: string;
+      fence: number;
+    }): Promise<Response> =>
+      fetch(`${base}/v1/checks/http-hr/expand`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...lease, children }),
+      });
+
+    const response1 = await postExpand(job);
+    assert.equal(response1.status, 200);
+    const ack1 = (await response1.json()) as { totalChildren: number };
+    const response2 = await postExpand(job);
+    assert.equal(response2.status, 200, 'retry after a lost response is accepted');
+    const ack2 = (await response2.json()) as { totalChildren: number };
+    assert.equal(ack2.totalChildren, 25);
+    assert.deepEqual(ack2, ack1);
+
+    // The client helper's own transport-retry path stays idempotent too.
+    const ack3 = (await client.expand(job, children)) as { totalChildren: number };
+    assert.equal(ack3.totalChildren, 25);
+
+    const forbidden = await postExpand({ ...job, leaseToken: 'wrong-token' });
+    assert.equal(forbidden.status, 409);
+    const forbiddenBody = (await forbidden.json()) as { code?: string };
+    assert.equal(forbiddenBody.code, 'LEASE_FENCED');
+
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('PRAGMA busy_timeout=10000');
+    const n = raw
+      .prepare("SELECT COUNT(*) AS n FROM checks WHERE parent_id = 'http-hr'")
+      .get() as { n: number | bigint };
+    assert.equal(Number(n.n), 25, 'HTTP retry did not double-register the checklist');
+    raw.close();
+
+    const stats = await client.getStats();
+    assertStatsWithinLimit(stats);
+    log('handoff retry over HTTP: duplicate POSTs returned the same ack, 25 children registered once');
+  } finally {
+    handle.close();
+  }
+}
+
 function assertSingleSlotEvents(events: any[]): void {
   let active = 0;
   let maxActive = 0;
@@ -326,7 +476,7 @@ function assertSingleSlotEvents(events: any[]): void {
 }
 
 async function testSingleProcessCapOneTree(dir: string): Promise<void> {
-  log('4/6 one real worker process, cap=1, multi-layer failure-bearing tree');
+  log('6/9 one real worker process, cap=1, multi-layer failure-bearing tree');
   const dbPath = join(dir, 'single-cap-one.sqlite');
   const queue = new Queue({ dbPath, readyLimit: 1, leaseMs: 10_000 });
   queue.submitRoot({
@@ -394,7 +544,7 @@ interface MarkerRow {
 }
 
 async function testMultiProcessKillAndRecovery(dir: string): Promise<void> {
-  log('5/6 three worker processes: multiprocess claiming');
+  log('7/9 three worker processes: multiprocess claiming');
   const dbPath = join(dir, 'recovery.sqlite');
   const limit = 3;
   const server = await startSpawnedServer(dbPath, limit, 1_200);
@@ -454,7 +604,22 @@ async function testMultiProcessKillAndRecovery(dir: string): Promise<void> {
       `workers=${beforeKill.distinctClaimWorkers.join(',')}`,
   );
 
-  log('6/6 SIGKILL server and all workers; restart service and replacement workers');
+  log('8/9 SIGKILL server and all workers; restart service and replacement workers');
+
+  // Snapshot every acknowledged child result and the event horizon BEFORE the
+  // kill so we can prove completed children are never claimed again and their
+  // result rows are never replaced.
+  const preKillRaw = new DatabaseSync(dbPath);
+  preKillRaw.exec('PRAGMA busy_timeout=10000');
+  const preKillResults = preKillRaw
+    .prepare('SELECT child_id, completed_at FROM child_results')
+    .all() as Array<{ child_id: string; completed_at: number | bigint }>;
+  const horizonRow = preKillRaw
+    .prepare('SELECT COALESCE(MAX(id), 0) AS n FROM worker_events')
+    .get() as { n: number | bigint };
+  const preKillEventHorizon = Number(horizonRow.n);
+  preKillRaw.close();
+
   await forceKill([server.process, ...workers]);
 
   // Opening the database after SIGKILL exercises SQLite recovery and proves
@@ -545,6 +710,35 @@ async function testMultiProcessKillAndRecovery(dir: string): Promise<void> {
   assert.ok(markerAfter);
   assert.equal(markerAfter.completed_at, marker!.completed_at, 'pre-kill result was reused, not replaced');
 
+  // Every child already terminal before the kill keeps its exact completed_at
+  // and has no new claimed event after the pre-kill event horizon.
+  const newClaimRows = rawFinal
+    .prepare(
+      `SELECT DISTINCT check_id FROM worker_events
+       WHERE event = 'claimed' AND id > ? AND check_id IS NOT NULL`,
+    )
+    .all(preKillEventHorizon) as Array<{ check_id: string }>;
+  const newClaimIds = new Set(newClaimRows.map((r) => r.check_id));
+  let checkedPreKillResults = 0;
+  const unchangedStmt = rawFinal.prepare(
+    'SELECT completed_at FROM child_results WHERE child_id = ?',
+  );
+  for (const pre of preKillResults) {
+    const after = unchangedStmt.get(pre.child_id) as { completed_at: number | bigint } | undefined;
+    assert.ok(after, `pre-kill result ${pre.child_id} survives recovery`);
+    assert.equal(
+      Number(after.completed_at),
+      Number(pre.completed_at),
+      `pre-kill result ${pre.child_id} was not replaced`,
+    );
+    assert.ok(
+      !newClaimIds.has(pre.child_id),
+      `completed child ${pre.child_id} must not be claimed again after restart`,
+    );
+    checkedPreKillResults += 1;
+  }
+  assert.ok(checkedPreKillResults >= 6, 'the no-reclaim check covered real pre-kill results');
+
   const checkCount = Number(
     (rawFinal.prepare('SELECT COUNT(*) AS n FROM checks').get() as { n: number | bigint }).n,
   );
@@ -563,17 +757,240 @@ async function testMultiProcessKillAndRecovery(dir: string): Promise<void> {
   finalQueue.close();
 }
 
+async function testWideHandoffThenKill(dir: string): Promise<void> {
+  const width = 200;
+  const limit = 4; // 50x buffer: a checklist far wider than the ready buffer.
+  log(
+    `9/9 宽清单强停场景: ${width} children vs readyLimit=${limit} (far wider than buffer); ` +
+      'handoff confirmed, then 同时强停 service + original Worker (SIGKILL), restart and finish',
+  );
+  const dbPath = join(dir, 'wide-handoff-kill.sqlite');
+  const server = await startSpawnedServer(dbPath, limit, 900);
+  const client = new HttpQueueClient(`http://127.0.0.1:${server.port}`);
+
+  const originalWorker = spawnCli(
+    [
+      'worker',
+      '--http',
+      `http://127.0.0.1:${server.port}`,
+      '--fixtures',
+      '--worker-id',
+      'wide-original',
+      '--poll-ms',
+      '5',
+      '--heartbeat-ms',
+      '150',
+      '--replenish-ms',
+      '30',
+    ],
+    'wide-original-worker',
+  );
+
+  await client.submitRoot({
+    id: 'wide-root',
+    kind: 'fixture.tree',
+    input: { depth: 1, breadth: width - 1, includeFailure: true, delayMs: 2, label: 'wide' },
+  });
+
+  // Confirm the durable full handoff: the expanded event carries the whole
+  // requested checklist and progress already counts every logical row.
+  await waitFor(
+    async () => {
+      const stats = await client.getStats();
+      const event = stats.events.find(
+        (e) => e.event === 'expanded' && e.checkId === 'wide-root',
+      ) as { detail?: { children?: number } } | undefined;
+      return event && event.detail?.children === width ? event : null;
+    },
+    { timeoutMs: 10_000, intervalMs: 40, label: 'wide checklist handoff confirmation' },
+  );
+  const handedOff = await client.getProgress('wide-root');
+  assert.equal(handedOff.total, width + 1, 'every child row is registered at handoff');
+
+  // Snapshot whatever (if anything) already finished in the tiny window
+  // between handoff confirmation and the simultaneous SIGKILL. The kill is
+  // deliberately immediate: this is the "confirmed handoff, then kill both"
+  // scenario. The substantive completed-child no-reclaim check is section 8.
+  const preKillRaw = new DatabaseSync(dbPath);
+  preKillRaw.exec('PRAGMA busy_timeout=10000');
+  const preKillResults = preKillRaw
+    .prepare('SELECT child_id, completed_at FROM child_results')
+    .all() as Array<{ child_id: string; completed_at: number | bigint }>;
+  const horizonRow = preKillRaw
+    .prepare('SELECT COALESCE(MAX(id), 0) AS n FROM worker_events')
+    .get() as { n: number | bigint };
+  const eventHorizon = Number(horizonRow.n);
+  preKillRaw.close();
+
+  // The named scenario: kill service AND the original worker at once, right
+  // after the full checklist handoff was confirmed.
+  await forceKill([server.process, originalWorker]);
+
+  const killedQueue = new Queue({ dbPath, readyLimit: limit });
+  const killedStats = killedQueue.stats(100_000);
+  assertStatsWithinLimit(killedStats);
+  assert.equal(killedStats.readyPeak, limit);
+  const killedRaw = new DatabaseSync(dbPath);
+  killedRaw.exec('PRAGMA busy_timeout=10000');
+  const handoffReceipts = killedRaw
+    .prepare("SELECT COUNT(*) AS n FROM operation_receipts WHERE op = 'expand' AND check_id = 'wide-root'")
+    .get() as { n: number | bigint };
+  assert.equal(Number(handoffReceipts.n), 1, 'handoff receipt survived SIGKILL');
+  const killedChecks = killedRaw
+    .prepare("SELECT COUNT(*) AS n FROM checks WHERE root_id = 'wide-root'")
+    .get() as { n: number | bigint };
+  assert.equal(Number(killedChecks.n), width + 1);
+  killedRaw.close();
+  killedQueue.close();
+
+  // Restart service with replacement workers only; the original is gone.
+  const restarted = await startSpawnedServer(dbPath, limit, 900);
+  const recoveredClient = new HttpQueueClient(`http://127.0.0.1:${restarted.port}`);
+  const recoveryWorkers: SpawnedProcess[] = [];
+  for (const workerId of ['wide-r1', 'wide-r2']) {
+    recoveryWorkers.push(
+      spawnCli(
+        [
+          'worker',
+          '--http',
+          `http://127.0.0.1:${restarted.port}`,
+          '--fixtures',
+          '--worker-id',
+          workerId,
+          '--poll-ms',
+          '8',
+          '--heartbeat-ms',
+          '200',
+          '--replenish-ms',
+          '30',
+        ],
+        workerId,
+      ),
+    );
+  }
+
+  const progress = await waitFor(
+    async () => {
+      const value = await recoveredClient.getProgress('wide-root').catch(() => null);
+      return value && ['completed', 'failed'].includes(value.status) ? value : null;
+    },
+    { timeoutMs: 45_000, intervalMs: 150, label: 'wide root terminal after restart' },
+  );
+  assert.equal(progress.status, 'completed', JSON.stringify(progress));
+
+  const expectedKeys = [
+    ...Array.from({ length: width - 1 }, (_, i) => `b${i}`),
+    'required-bad-child',
+  ];
+  const result = progress.result as {
+    receivedChildCount: number;
+    childKeys: string[];
+    failedChildren: Array<{ key: string }>;
+    children: Array<{ key: string; ordinal: number; status: string }>;
+  };
+  assert.equal(result.receivedChildCount, width);
+  assert.deepEqual(result.childKeys, expectedKeys, 'parent receives results in checklist order');
+  assert.deepEqual(
+    result.children.map((c) => c.ordinal),
+    Array.from({ length: width }, (_, i) => i),
+    'ordinals cover the original checklist exactly and in order',
+  );
+  assert.equal(result.failedChildren.length, 1);
+  assert.equal(result.failedChildren[0]?.key, 'required-bad-child');
+  assert.equal(result.children.at(-1)?.status, 'failed', 'failure is delivered as a terminal result');
+  assert.ok(
+    result.children.slice(0, -1).every((c) => c.status === 'completed'),
+    'all ordinary children completed',
+  );
+
+  await forceKill(recoveryWorkers);
+  restarted.process.child.kill('SIGTERM');
+  await restarted.process.exited.catch(() => undefined);
+
+  const finalQueue = new Queue({ dbPath, readyLimit: limit });
+  const stats = finalQueue.stats(100_000);
+  assertStatsWithinLimit(stats);
+  assert.equal(stats.readyPeak, limit, 'global ready peak never exceeded the cap');
+  for (const op of ['expand', 'claim', 'replenish'] as const) {
+    const maxRead = stats.listReadMaxByOp[op] ?? 0;
+    assert.ok(maxRead <= limit, `${op} actual read max ${maxRead} exceeds ${limit}`);
+    log(`wide scenario ${op}: maxActualRead(实际读取量)=${maxRead} <= limit ${limit}`);
+  }
+  assert.ok(stats.distinctClaimWorkers.includes('wide-original'));
+  assert.ok(stats.distinctClaimWorkers.some((id) => id.startsWith('wide-r')));
+
+  const rawFinal = new DatabaseSync(dbPath);
+  rawFinal.exec('PRAGMA busy_timeout=10000');
+  assert.equal(
+    Number(
+      (rawFinal.prepare('SELECT COUNT(*) AS n FROM checks').get() as { n: number | bigint }).n,
+    ),
+    width + 1,
+  );
+  assert.equal(
+    Number(
+      (rawFinal.prepare('SELECT COUNT(*) AS n FROM child_results').get() as { n: number | bigint })
+        .n,
+    ),
+    width,
+  );
+  const dupes = rawFinal
+    .prepare('SELECT child_id, COUNT(*) AS c FROM child_results GROUP BY child_id HAVING COUNT(*) > 1')
+    .all();
+  assert.equal(dupes.length, 0, 'one result row per logical child');
+
+  const newClaims = rawFinal
+    .prepare(
+      `SELECT DISTINCT check_id FROM worker_events
+        WHERE event = 'claimed' AND id > ? AND check_id IS NOT NULL`,
+    )
+    .all(eventHorizon) as Array<{ check_id: string }>;
+  const newClaimIds = new Set(newClaims.map((r) => r.check_id));
+  const unchangedStmt = rawFinal.prepare(
+    'SELECT completed_at FROM child_results WHERE child_id = ?',
+  );
+  for (const pre of preKillResults) {
+    const after = unchangedStmt.get(pre.child_id) as { completed_at: number | bigint } | undefined;
+    assert.ok(after, `pre-kill completed child ${pre.child_id} still has its result`);
+    assert.equal(
+      Number(after.completed_at),
+      Number(pre.completed_at),
+      `completed child ${pre.child_id} result not replaced`,
+    );
+    assert.ok(
+      !newClaimIds.has(pre.child_id),
+      `completed child ${pre.child_id} must not be claimed again after restart`,
+    );
+  }
+  rawFinal.close();
+  finalQueue.close();
+  log(
+    `wide handoff recovery OK: ${width} ordered results incl. failure; ` +
+      `${preKillResults.length} child result(s) survived the immediate kill and were never re-claimed; ` +
+      `readyPeak=${stats.readyPeak}`,
+  );
+}
+
 async function main(): Promise<void> {
   log(`using temporary database directory ${tempRoot}`);
   try {
     await testLeaseFencing(tempRoot);
     await testFairnessSecondClaim(tempRoot);
     await testLargeChecklistAndLimits(tempRoot);
+    await testHandoffRetryDirect(tempRoot);
+    await testHttpHandoffRetry(tempRoot);
     await testSingleProcessCapOneTree(tempRoot);
     await testMultiProcessKillAndRecovery(tempRoot);
+    await testWideHandoffThenKill(tempRoot);
 
     const elapsedMs = Date.now() - startedAt;
-    log(`PASS: all persistence, recovery, fairness, and limit checks passed in ${(elapsedMs / 1000).toFixed(1)}s`);
+    log(
+      `PASS: all persistence, recovery, fairness, and limit checks passed in ${(elapsedMs / 1000).toFixed(1)}s — ` +
+        `coverage: 实际读取量 bounded actual reads + global ready peak; 交接重试 handoff retry ` +
+        `idempotent/no duplicate registration; stale-lease fencing; completed children not ` +
+        `re-claimed; parent receives all ordered results incl. failures; far-wider-than-buffer ` +
+        `confirmed-handoff SIGKILL(强停) of service and original worker then restart completes.`,
+    );
     if (elapsedMs > 75_000) {
       throw new Error(`verification logic took ${elapsedMs}ms, leaving insufficient margin for the 80s command`);
     }

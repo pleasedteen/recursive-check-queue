@@ -52,6 +52,30 @@ export class HttpQueueClient implements WorkerBackend {
     return this.request<T>(path, { method: 'POST', body: JSON.stringify(body) });
   }
 
+  /**
+   * Retry a same-payload idempotent mutation when the response may have been
+   * lost in transit (connection/timeout/5xx). Definitive 4xx responses such as
+   * LEASE_FENCED are returned immediately. The server deduplicates by lease
+   * generation, so retries never register children or results twice.
+   */
+  private async postIdempotent<T>(path: string, body: unknown): Promise<T> {
+    const attempts = 3;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await this.post<T>(path, body);
+      } catch (error) {
+        lastError = error;
+        const status = (error as { statusCode?: number } | null)?.statusCode;
+        const retriable =
+          status === undefined || status === 408 || status === 429 || (status >= 500 && status < 600);
+        if (!retriable || attempt === attempts - 1) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 30 * 2 ** attempt));
+      }
+    }
+    throw lastError;
+  }
+
   async submitRoot(descriptor: CheckDescriptor & { id?: string }): Promise<{ id: string; status: string }> {
     return this.post('/v1/checks', descriptor);
   }
@@ -77,7 +101,7 @@ export class HttpQueueClient implements WorkerBackend {
   }
 
   async expand(lease: Lease, children: CheckDescriptor[]): Promise<unknown> {
-    return this.post(`/v1/checks/${encodeURIComponent(lease.id)}/expand`, {
+    return this.postIdempotent(`/v1/checks/${encodeURIComponent(lease.id)}/expand`, {
       workerId: lease.workerId,
       leaseToken: lease.leaseToken,
       fence: lease.fence,

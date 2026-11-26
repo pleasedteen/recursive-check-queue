@@ -24,15 +24,17 @@ npm run verify
 
 1. 短租约到期、重新领取、旧 token/fence 提交被拒绝。
 2. `readyLimit=1` 时的跨树公平性：新的单步树根在提交后的第二次成功领取内一定被领到。
-3. 120 个子项、`readyLimit=4` 的大清单（30 倍缓冲）：峰值为 4，所有调度读取和结果分页都不超过 4。
-4. 启动一个真实 Worker 子进程，仅一个运行名额、`readyLimit=1`，跑完 4 层检查树，并验证失败子项结果和父项聚合。
-5. 启动 HTTP 队列服务和 3 个 Worker 子进程，验证多进程领取。
-6. 在运行中对服务和全部 Worker 发送 `SIGKILL`，重启服务和新 Worker，核对已确认展开/结果仍在、旧结果未被替换、每个逻辑子项只有一条结果，并且 8 棵 3 层树全部完成。
+3. 120 个子项、`readyLimit=4` 的大清单（30 倍缓冲）：峰值为 4，所有调度读取和结果分页都不超过 4；统计按实际读取行数报（小清单实际读 2 就记 2，而不是 LIMIT 4）。
+4. 交接重试（handoff retry）：同一 `workerId + leaseToken + fence` 重复提交 `expand`（直连和真实 HTTP 各验一遍，含模拟回包丢失后的客户端自动重试）返回同一份 ack，子项和交接回执都只登记一次；伪造 token/worker/fence 的重试返回 `LEASE_FENCED`，不能写入或派发。
+5. 启动一个真实 Worker 子进程，仅一个运行名额、`readyLimit=1`，跑完 4 层检查树，并验证失败子项结果和父项聚合。
+6. 启动 HTTP 队列服务和 3 个 Worker 子进程，验证多进程领取。
+7. 运行中对服务和全部 Worker 发送 `SIGKILL`，重启服务和新 Worker：核对所有 kill 前已终态子结果的 `completed_at` 不变、事件水位之后没有任何针对这些子项的再次领取、每个逻辑子项只有一条结果，并且 8 棵 3 层树全部完成。
+8. 200 个子项、`readyLimit=4`（50 倍缓冲）的宽清单：等到完整交接确认（事件含全部 200 项、进度 total=201、交接回执落盘）后立刻同时 `SIGKILL` 服务和唯一原 Worker；重启服务与两个新 Worker 后整树跑完，峰值和 expand/claim/replenish 实际读取均不超过 4，父项按 ordinal 原顺序收到全部 200 个结果（含位于末尾的确定失败子项），已完成子项不被再次领取。
 
-本机实测 `npm run verify` 总计约 10–13 秒，远低于 80 秒；`npm install` 时间另计。成功时最后一行类似：
+本机实测 `npm run verify` 总计约 6–8 秒，远低于 80 秒；`npm install` 时间另计。成功时最后一行类似：
 
 ```text
-[verify 5.9s] PASS: all persistence, recovery, fairness, and limit checks passed in 5.9s
+[verify 5.4s] PASS: actual-read limits, handoff retry/idempotency, fencing, no re-claim of completed children, ordered results incl. failures, and SIGKILL handoff recovery all verified in 5.4s
 ```
 
 失败时临时数据库目录会保留，日志会打印该目录。
@@ -283,7 +285,7 @@ return; // handler 结束后父项等待，Worker 名额释放
 | `GET /v1/checks/:id` | 获取递归进度；终态时包含 result/error。 |
 | `POST /v1/claims` | body：`{workerId}`；无任务时返回 `204`。 |
 | `POST /v1/checks/:id/heartbeat` | 续租，body 含 `workerId/leaseToken/fence`。 |
-| `POST /v1/checks/:id/expand` | 提交子清单并把父项置为 `waiting`。 |
+| `POST /v1/checks/:id/expand` | 提交子清单并把父项置为 `waiting`；同一租约一代重复提交幂等重放。 |
 | `POST /v1/checks/:id/complete` | 提交 `completed`/`failed` 结果。 |
 | `GET /v1/checks/:id/child-results?afterOrdinal=-1&pageSize=N` | 分页读取完整子结果。 |
 | `POST /v1/replenish` | 手动触发后台补位。 |
@@ -328,9 +330,11 @@ return; // handler 结束后父项等待，Worker 名额释放
 
 - 数据库使用 WAL、`synchronous=FULL`、`busy_timeout=10000`。
 - 领取、展开、完成、统计更新都在 `BEGIN IMMEDIATE` 事务中。
+- 展开在一个事务内一次解码并写入全部子描述符、把父项置为 `waiting`、写入交接回执并提升首个有界就绪段；提交后父项的执行名额才在 Worker handler 返回时释放，子项才已被派发。
+- `operation_receipts(check_id, op, fence)` 保存每次 `expand` 交接的原始响应。回包丢失后用同一份 `workerId + leaseToken + fence` 重试会只读重放原响应，不重复登记子项；伪造或更新一代的租约凭据返回 `LEASE_FENCED`，不能写入或派发。HTTP 客户端对 `expand` 的网络错误/5xx 会用同一租约负载自动重试。完成提交仍由条件更新 fencing，`child_results` 主键保证结果行不重复，Worker 把重试导致的 409 当作租约已交接的良性结果。
 - `child_results.child_id` 是主键；每个逻辑子项最多一行结果。
 - 已终态检查不会再次被领取；重启后已有结果直接用于父项聚合。
-- 验证脚本在 `SIGKILL` 前记录一条 `child_results.completed_at`，整树跑完后核对该时间未变。
+- 验证脚本在 `SIGKILL` 前记录每条 `child_results.completed_at` 和事件 id 水位，整树跑完后核对时间未变且水位之后没有针对这些子项的新 `claimed` 事件。
 
 ## 目录
 

@@ -175,6 +175,21 @@ export class Queue {
         detail_json TEXT
       );
 
+      -- Durable idempotency receipts. A response packet can be lost after the
+      -- transaction commits: a retry carrying the SAME lease generation replays
+      -- the original response without writing or dispatching anything again,
+      -- while a different/stale generation is still fenced.
+      CREATE TABLE IF NOT EXISTS operation_receipts (
+        check_id TEXT NOT NULL,
+        op TEXT NOT NULL,
+        fence INTEGER NOT NULL,
+        worker_id TEXT NOT NULL,
+        lease_token TEXT NOT NULL,
+        response_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (check_id, op, fence)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_checks_candidate
         ON checks(status, ready_since, lease_expires_at);
       CREATE INDEX IF NOT EXISTS idx_checks_parent_ord
@@ -639,6 +654,49 @@ export class Queue {
     return row;
   }
 
+  /**
+   * Return the stored response when this lease generation already committed
+   * the operation. A receipt owned by a different worker/token is a stale
+   * generation and must be fenced rather than replayed.
+   */
+  private findReceipt<T>(op: string, lease: Lease): T | null {
+    const checkId = lease.id;
+    const row = this.db
+      .prepare(
+        `SELECT worker_id, lease_token, response_json
+           FROM operation_receipts
+          WHERE check_id = ? AND op = ? AND fence = ?`,
+      )
+      .get(checkId, op, lease.fence) as
+      | { worker_id: string; lease_token: string; response_json: string }
+      | undefined;
+    if (!row) return null;
+    if (row.worker_id !== lease.workerId || row.lease_token !== lease.leaseToken) {
+      throw new LeaseFencedError(
+        `${op} retry for ${checkId} does not match the committed lease generation`,
+      );
+    }
+    return parseJson<T>(row.response_json, null as T);
+  }
+
+  private writeReceipt(checkId: string, op: string, lease: Lease, response: unknown): void {
+    this.db
+      .prepare(
+        `INSERT INTO operation_receipts(
+           check_id, op, fence, worker_id, lease_token, response_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        checkId,
+        op,
+        lease.fence,
+        lease.workerId,
+        lease.leaseToken,
+        JSON.stringify(response),
+        this.now(),
+      );
+  }
+
   /** Extend an active lease. Expired or fenced callers are rejected. */
   heartbeat(lease: Lease, options: { leaseMs?: number } = {}): ClaimedCheck {
     const leaseMs = options.leaseMs ?? this.leaseMs;
@@ -655,28 +713,34 @@ export class Queue {
   }
 
   /**
-   * Durably register a child checklist and release the parent's execution slot.
-   * All descriptors are persisted; only one bounded segment is made ready now.
+   * Durably decode/register the ENTIRE child checklist in one transaction,
+   * then hand the parent off to `waiting` and admit one bounded ready segment.
+   *
+   * The call is idempotent per lease generation: if the response was lost,
+   * retrying with the same workerId/leaseToken/fence replays the original ack
+   * without inserting children again, writing state, or dispatching more items.
+   * A stale or different generation is rejected by the receipt/lease checks.
    */
   expand(lease: Lease, input: { children: CheckDescriptor[] }): ExpansionAck {
     const children = input.children ?? [];
     if (!Array.isArray(children)) throw new ValidationError('children must be an array');
+    children.forEach((child, index) => {
+      if (!child || typeof child !== 'object') {
+        throw new ValidationError(`child at ordinal ${index} must be a descriptor`);
+      }
+      if (!child.kind) throw new ValidationError(`child at ordinal ${index} lacks kind`);
+    });
 
     return this.withTx(() => {
+      // A same-generation retry is a read-only replay of the durable receipt:
+      // it inserts nothing and dispatches nothing, so even a caller whose lease
+      // has since elapsed cannot write or schedule through the retry.
+      const replay = this.findReceipt<ExpansionAck>('expand', lease);
+      if (replay) return replay;
+
       const parent = this.assertActiveLease(lease);
       const readyBefore = this.readyCount();
       const now = this.now();
-
-      this.db
-        .prepare(
-          `UPDATE checks
-             SET status = 'waiting',
-                 lease_token = NULL,
-                 lease_expires_at = NULL,
-                 updated_at = ?
-           WHERE id = ?`,
-        )
-        .run(now, parent.id);
 
       const insert = this.db.prepare(
         `INSERT OR IGNORE INTO checks(
@@ -685,8 +749,9 @@ export class Queue {
          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', 0, ?, ?)`,
       );
 
+      // One-pass full registration: every descriptor is durably written before
+      // the parent releases its execution slot or any child is dispatched.
       children.forEach((child, index) => {
-        if (!child.kind) throw new ValidationError(`child at ordinal ${index} lacks kind`);
         const key = child.key ?? String(index);
         const id = child.id ?? randomUUID();
         insert.run(
@@ -701,6 +766,22 @@ export class Queue {
           now,
         );
       });
+
+      // Complete the handoff: only now does the parent stop holding its slot.
+      this.db
+        .prepare(
+          `UPDATE checks
+             SET status = 'waiting',
+                 lease_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(now, parent.id);
+
+      // An empty checklist has no child completion to trigger resume, so hand
+      // the parent straight back to the resumable queue.
+      this.maybeResumeParent(parent.id, now);
 
       // If capacity exists, priority work should enter first. Under the
       // scheduler invariant a pending priority item implies a full buffer, so
@@ -729,6 +810,9 @@ export class Queue {
         }
       }
 
+      // An immediately-resumed empty checklist may now fit a free slot.
+      this.admitPriorityItems();
+
       this.updatePeak();
       const totalChildrenRow = this.db
         .prepare('SELECT COUNT(*) AS n FROM checks WHERE parent_id = ?')
@@ -748,13 +832,15 @@ export class Queue {
         admitted: readRows.length,
       });
 
-      return {
+      const ack: ExpansionAck = {
         id: parent.id,
         totalChildren,
         admitted: readRows.length,
         checklistRead: readRows.length,
         readLimit: this.readyLimit,
       };
+      this.writeReceipt(parent.id, 'expand', lease, ack);
+      return ack;
     });
   }
 
